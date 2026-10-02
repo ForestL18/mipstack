@@ -766,6 +766,13 @@ writes on connected UDP or IP sockets retain `net.ErrWriteToConnected`.
 Validated asynchronous ICMP errors also match their mapped syscall errors;
 their details remain available through `errors.As` to `mipstack.ICMPError`.
 
+`TCPConn.CloseRead` closes the application receive direction without resetting
+TCP, discards buffered receive data, and wakes reads waiting for data.
+`TCPConn.CloseWrite` closes the send direction, wakes writes waiting for
+send-buffer space, and queues FIN after accepted bytes.
+Both leave the opposite direction open and return without waiting for an active
+read or write to finish. They do not cancel a blocked external `ReadFrom` source
+or `WriteTo` destination.
 `TCPConn.SetLinger` provides background graceful close, abortive close, and a
 bounded wait for acknowledgement. `UDPConn.SetReadBuffer` changes the receive
 queue's approximate retained-memory capacity; payload, per-datagram metadata,

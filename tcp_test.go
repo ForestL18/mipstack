@@ -858,6 +858,509 @@ func TestTCPReaderFromWriterToAndMultipathQuery(t *testing.T) {
 	}
 }
 
+// TestTCPCloseWriteInterruptsWrites verifies that half-close neither waits for
+// send-buffer space nor for an external Reader. It delivers the accepted
+// stream prefix and FIN while the source remains blocked, and preserves the
+// independent receive direction.
+func TestTCPCloseWriteInterruptsWrites(t *testing.T) {
+	for _, address := range []netip.Addr{netip.MustParseAddr("192.0.2.203"), netip.MustParseAddr("2001:db8::203")} {
+		for _, mode := range []string{"Write", "ReadFrom", "ReaderData", "ReaderEOF", "ReaderCloseWrite"} {
+			t.Run(address.String()+"/"+mode, func(t *testing.T) {
+				const capacity = 4096
+				stack, err := New(Config{
+					LocalAddresses: []netip.Prefix{netip.PrefixFrom(address, address.BitLen())}, MTU: 1500,
+					TCP: TCPSocketDefaults{ReceiveBuffer: capacity, MaximumReceiveBuffer: capacity, SendBuffer: capacity, MaximumSendBuffer: capacity},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = stack.Close() })
+				if err = stack.Start(); err != nil {
+					t.Fatal(err)
+				}
+				network := "tcp4"
+				if address.Is6() {
+					network = "tcp6"
+				}
+				listener, err := stack.ListenTCP(context.Background(), network, netip.AddrPortFrom(address, 0))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = listener.Close() })
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				client, err := stack.DialTCP(ctx, network, netip.AddrPort{}, listener.Addr().(*net.TCPAddr).AddrPort())
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = client.Close() })
+				server, err := listener.Accept()
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = server.Close() })
+				connection := client.(*TCPConn)
+				type writeResult struct {
+					n   int64
+					err error
+				}
+				written := make(chan writeResult, 1)
+				payload := bytes.Repeat([]byte("accepted-prefix-"), capacity)
+				expected := payload
+				var releaseReader func()
+				var readerClosed chan error
+				if mode == "Write" || mode == "ReadFrom" {
+					go func() {
+						if mode == "Write" {
+							n, writeErr := connection.Write(payload)
+							written <- writeResult{int64(n), writeErr}
+						} else {
+							n, writeErr := connection.ReadFrom(bytes.NewReader(payload))
+							written <- writeResult{n, writeErr}
+						}
+					}()
+					waitFor(t, 2*time.Second, func() bool {
+						info := connection.Info()
+						connection.mu.Lock()
+						waiting := connection.sendBuffer.limited && connection.sendBuffer.size == capacity
+						connection.mu.Unlock()
+						return waiting && info.PeerWindow == 0
+					})
+				} else {
+					expected = []byte("queued before the external Reader")
+					if n, writeErr := connection.Write(expected); writeErr != nil || n != len(expected) {
+						t.Fatalf("initial Write = %d, %v", n, writeErr)
+					}
+					entered, release := make(chan struct{}), make(chan struct{})
+					var once sync.Once
+					releaseReader = func() { once.Do(func() { close(release) }) }
+					t.Cleanup(releaseReader)
+					readerClosed = make(chan error, 1)
+					go func() {
+						n, readErr := connection.ReadFrom(tcpTestReaderFunc(func(buffer []byte) (int, error) {
+							close(entered)
+							if mode == "ReaderCloseWrite" {
+								readerClosed <- connection.CloseWrite()
+								return 0, io.EOF
+							}
+							<-release
+							if mode == "ReaderEOF" {
+								return 0, io.EOF
+							}
+							return copy(buffer, []byte("not accepted after half-close")), io.EOF
+						}))
+						written <- writeResult{n, readErr}
+					}()
+					select {
+					case <-entered:
+					case <-time.After(2 * time.Second):
+						t.Fatal("ReadFrom did not enter the external Reader")
+					}
+				}
+				closed := make(chan error, 8)
+				for range [8]struct{}{} {
+					go func() { closed <- connection.CloseWrite() }()
+				}
+				for range [8]struct{}{} {
+					select {
+					case closeErr := <-closed:
+						if closeErr != nil {
+							t.Fatalf("CloseWrite = %v", closeErr)
+						}
+					case <-time.After(2 * time.Second):
+						t.Fatal("CloseWrite waited for the active write")
+					}
+				}
+				if mode == "ReaderCloseWrite" {
+					select {
+					case closeErr := <-readerClosed:
+						if closeErr != nil {
+							t.Fatalf("Reader CloseWrite = %v", closeErr)
+						}
+					case <-time.After(2 * time.Second):
+						t.Fatal("Reader CloseWrite deadlocked")
+					}
+				}
+				readerBlocked := mode == "ReaderData" || mode == "ReaderEOF"
+				var result writeResult
+				if !readerBlocked {
+					select {
+					case result = <-written:
+					case <-time.After(2 * time.Second):
+						t.Fatal("write did not observe the half-close")
+					}
+				}
+				if mode == "Write" || mode == "ReadFrom" {
+					if result.n <= 0 || result.n >= int64(len(payload)) || !errors.Is(result.err, net.ErrClosed) {
+						t.Fatalf("interrupted %s = %d, %v", mode, result.n, result.err)
+					}
+					operation := "write"
+					if mode == "ReadFrom" {
+						operation = "readfrom"
+					}
+					checkNetOpError(t, result.err, operation, network)
+					expected = payload[:int(result.n)]
+				}
+				_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+				received, readErr := io.ReadAll(server)
+				if readErr != nil || !bytes.Equal(received, expected) {
+					t.Fatalf("accepted prefix before EOF = %d bytes, %v; want %d matching bytes", len(received), readErr, len(expected))
+				}
+				if readerBlocked {
+					select {
+					case result := <-written:
+						t.Fatalf("ReadFrom returned before its Reader: %+v", result)
+					default:
+					}
+					releaseReader()
+					select {
+					case result = <-written:
+					case <-time.After(2 * time.Second):
+						t.Fatal("ReadFrom did not return after its Reader")
+					}
+				}
+				if mode == "ReaderData" {
+					if result.n != 0 || !errors.Is(result.err, net.ErrClosed) {
+						t.Fatalf("ReadFrom after Reader data = %d, %v", result.n, result.err)
+					}
+				} else if mode == "ReaderEOF" || mode == "ReaderCloseWrite" {
+					if result.n != 0 || result.err != nil {
+						t.Fatalf("ReadFrom after Reader EOF = %d, %v", result.n, result.err)
+					}
+				}
+				if n, writeErr := connection.Write([]byte("late")); n != 0 || !errors.Is(writeErr, net.ErrClosed) {
+					t.Fatalf("Write after CloseWrite = %d, %v", n, writeErr)
+				}
+				response := []byte("receive direction remains open")
+				if n, writeErr := server.Write(response); writeErr != nil || n != len(response) {
+					t.Fatalf("reverse Write = %d, %v", n, writeErr)
+				}
+				if err = server.(*TCPConn).CloseWrite(); err != nil {
+					t.Fatal(err)
+				}
+				_ = connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+				received, readErr = io.ReadAll(connection)
+				if readErr != nil || !bytes.Equal(received, response) {
+					t.Fatalf("reverse stream before EOF = %q, %v", received, readErr)
+				}
+			})
+		}
+	}
+}
+
+// TestTCPCloseWriteWithReservedDeviceQueue keeps every output slot unavailable
+// while half-close interrupts the writer. Releasing capacity must still send
+// the accepted prefix and FIN through the ordinary external packet path.
+func TestTCPCloseWriteWithReservedDeviceQueue(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.204"), netip.MustParseAddr("198.51.100.204"))
+	link.mu.Lock()
+	link.echoTCP = true
+	link.mu.Unlock()
+	client, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 45204))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	connection := client.(*TCPConn)
+	const capacity = 4096
+	_ = connection.SetWriteBuffer(capacity)
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	t.Cleanup(func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	})
+	waitFor(t, 2*time.Second, func() bool {
+		for len(held) < cap(held) {
+			slot, ok := stack.outbound.tryReserve()
+			if !ok {
+				return false
+			}
+			held = append(held, slot)
+		}
+		return true
+	})
+	type writeResult struct {
+		n   int
+		err error
+	}
+	payload := bytes.Repeat([]byte{0x6d}, 64*1024)
+	written := make(chan writeResult, 1)
+	go func() {
+		n, writeErr := connection.Write(payload)
+		written <- writeResult{n, writeErr}
+	}()
+	waitFor(t, 2*time.Second, func() bool {
+		connection.mu.Lock()
+		defer connection.mu.Unlock()
+		return connection.sendBuffer.limited && connection.sendBuffer.size == capacity
+	})
+	closed := make(chan error, 1)
+	go func() { closed <- connection.CloseWrite() }()
+	select {
+	case err = <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CloseWrite waited for device capacity")
+	}
+	select {
+	case result := <-written:
+		if result.n != capacity || !errors.Is(result.err, net.ErrClosed) {
+			t.Fatalf("Write with unavailable device capacity = %d, %v", result.n, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer was not woken by CloseWrite")
+	}
+	for _, slot := range held {
+		stack.outbound.releaseReserved(slot)
+	}
+	held = nil
+	_ = connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+	received, err := io.ReadAll(connection)
+	if err != nil || !bytes.Equal(received, payload[:capacity]) {
+		t.Fatalf("accepted external prefix before EOF = %d bytes, %v", len(received), err)
+	}
+}
+
+// TestTCPCloseReadWithBlockedReads verifies that read half-close wakes source
+// reads without waiting for or canceling an external Writer, and preserves
+// the independent send direction.
+func TestTCPCloseReadWithBlockedReads(t *testing.T) {
+	for _, address := range []netip.Addr{netip.MustParseAddr("192.0.2.205"), netip.MustParseAddr("2001:db8::205")} {
+		for _, mode := range []string{"Read", "ReadWithBuffer", "WriteTo", "Writer", "TCPWriter"} {
+			t.Run(address.String()+"/"+mode, func(t *testing.T) {
+				const capacity = 64
+				stack, err := New(Config{
+					LocalAddresses: []netip.Prefix{netip.PrefixFrom(address, address.BitLen())}, MTU: 1500,
+					TCP: TCPSocketDefaults{ReceiveBuffer: capacity, MaximumReceiveBuffer: capacity, SendBuffer: capacity, MaximumSendBuffer: capacity},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = stack.Close() })
+				if err = stack.Start(); err != nil {
+					t.Fatal(err)
+				}
+				network := "tcp4"
+				if address.Is6() {
+					network = "tcp6"
+				}
+				listener, err := stack.ListenTCP(context.Background(), network, netip.AddrPortFrom(address, 0))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = listener.Close() })
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				client, err := stack.DialTCP(ctx, network, netip.AddrPort{}, listener.Addr().(*net.TCPAddr).AddrPort())
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = client.Close() })
+				server, err := listener.Accept()
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = server.Close() })
+				connection := client.(*TCPConn)
+				payload := []byte("consumed before the blocked Writer")
+				var destination io.Writer = io.Discard
+				var releaseWriter func()
+				var entered chan struct{}
+				var target, targetPeer *TCPConn
+				var targetPrefix []byte
+				if mode == "Writer" {
+					entered = make(chan struct{})
+					release := make(chan struct{})
+					var once sync.Once
+					releaseWriter = func() { once.Do(func() { close(release) }) }
+					t.Cleanup(releaseWriter)
+					destination = tcpTestWriterFunc(func(buffer []byte) (int, error) {
+						close(entered)
+						<-release
+						if !bytes.Equal(buffer, payload) {
+							t.Errorf("blocked Writer data = %q, want %q", buffer, payload)
+						}
+						return len(buffer), nil
+					})
+				} else if mode == "TCPWriter" {
+					outgoing, dialErr := stack.DialTCP(ctx, network, netip.AddrPort{}, listener.Addr().(*net.TCPAddr).AddrPort())
+					if dialErr != nil {
+						t.Fatal(dialErr)
+					}
+					t.Cleanup(func() { _ = outgoing.Close() })
+					incoming, acceptErr := listener.Accept()
+					if acceptErr != nil {
+						t.Fatal(acceptErr)
+					}
+					t.Cleanup(func() { _ = incoming.Close() })
+					target, targetPeer = outgoing.(*TCPConn), incoming.(*TCPConn)
+					// Fill the negotiated receive window, then the target send
+					// buffer, so WriteTo must wait for the peer to start reading.
+					targetPrefix = bytes.Repeat([]byte{0x6d}, capacity)
+					if n, writeErr := target.Write(targetPrefix); writeErr != nil || n != len(targetPrefix) {
+						t.Fatalf("initial target Write = %d, %v", n, writeErr)
+					}
+					waitFor(t, 2*time.Second, func() bool {
+						info := target.Info()
+						return info.PeerWindow == 0 && info.SendBufferSize == 0
+					})
+					if n, writeErr := target.Write(targetPrefix); writeErr != nil || n != len(targetPrefix) {
+						t.Fatalf("queued target Write = %d, %v", n, writeErr)
+					}
+					targetPrefix = bytes.Repeat([]byte{0x6d}, 2*capacity)
+					destination = target
+				}
+				type readResult struct {
+					n   int64
+					err error
+				}
+				readDone := make(chan readResult, 1)
+				callbackCalled := false
+				go func() {
+					var n int64
+					var readErr error
+					switch mode {
+					case "Read":
+						count, err := connection.Read(make([]byte, 1))
+						n, readErr = int64(count), err
+					case "ReadWithBuffer":
+						count, err := connection.ReadWithBuffer(func(_ int) []byte {
+							callbackCalled = true
+							return make([]byte, 1)
+						})
+						n, readErr = int64(count), err
+					default:
+						n, readErr = connection.WriteTo(destination)
+					}
+					readDone <- readResult{n, readErr}
+				}()
+				writerBlocked := mode == "Writer" || mode == "TCPWriter"
+				if writerBlocked {
+					if n, writeErr := server.Write(payload); writeErr != nil || n != len(payload) {
+						t.Fatalf("source Write = %d, %v", n, writeErr)
+					}
+					if mode == "Writer" {
+						select {
+						case <-entered:
+						case <-time.After(2 * time.Second):
+							t.Fatal("WriteTo did not enter the external Writer")
+						}
+					} else {
+						waitFor(t, 2*time.Second, func() bool {
+							target.mu.Lock()
+							defer target.mu.Unlock()
+							return target.sendBuffer.limited && target.sendBuffer.size == target.sendCapacity
+						})
+					}
+				} else {
+					waitFor(t, 2*time.Second, func() bool {
+						connection.mu.Lock()
+						defer connection.mu.Unlock()
+						return connection.readNotify != nil && connection.readBuffer.size == 0 && connection.readErr == nil
+					})
+				}
+				select {
+				case result := <-readDone:
+					t.Fatalf("read returned before half-close: %+v", result)
+				default:
+				}
+				closed := make(chan error, 1)
+				go func() { closed <- connection.CloseRead() }()
+				select {
+				case closeErr := <-closed:
+					if closeErr != nil {
+						t.Fatalf("CloseRead = %v", closeErr)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("CloseRead waited for the active read")
+				}
+				var result readResult
+				if !writerBlocked {
+					select {
+					case result = <-readDone:
+					case <-time.After(2 * time.Second):
+						t.Fatal("read was not woken by CloseRead")
+					}
+				}
+				response := []byte("send direction remains open")
+				if n, writeErr := connection.Write(response); writeErr != nil || n != len(response) {
+					t.Fatalf("Write after CloseRead = %d, %v", n, writeErr)
+				}
+				if err = connection.CloseWrite(); err != nil {
+					t.Fatal(err)
+				}
+				_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+				received, readErr := io.ReadAll(server)
+				if readErr != nil || !bytes.Equal(received, response) {
+					t.Fatalf("send stream after CloseRead = %q, %v; want %q before EOF", received, readErr, response)
+				}
+				type targetResult struct {
+					payload []byte
+					err     error
+				}
+				var targetRead chan targetResult
+				if writerBlocked {
+					select {
+					case result := <-readDone:
+						t.Fatalf("WriteTo returned while its Writer was blocked: %+v", result)
+					default:
+					}
+					if releaseWriter != nil {
+						releaseWriter()
+					} else {
+						targetRead = make(chan targetResult, 1)
+						_ = targetPeer.SetReadDeadline(time.Now().Add(2 * time.Second))
+						go func() {
+							data, err := io.ReadAll(targetPeer)
+							targetRead <- targetResult{data, err}
+						}()
+					}
+					select {
+					case result = <-readDone:
+					case <-time.After(2 * time.Second):
+						t.Fatal("WriteTo did not return after its Writer resumed")
+					}
+				}
+				var expectedCount int64
+				operation := "read"
+				if mode != "Read" && mode != "ReadWithBuffer" {
+					operation = "writeto"
+				}
+				if writerBlocked {
+					expectedCount = int64(len(payload))
+				}
+				if result.n != expectedCount || !errors.Is(result.err, net.ErrClosed) || callbackCalled {
+					t.Fatalf("%s after CloseRead = %d, %v, callback called %t; want %d, closed, false", mode, result.n, result.err, callbackCalled, expectedCount)
+				}
+				checkNetOpError(t, result.err, operation, network)
+				if targetRead != nil {
+					if err = target.CloseWrite(); err != nil {
+						t.Fatal(err)
+					}
+					select {
+					case forwarded := <-targetRead:
+						expected := append(targetPrefix, payload...)
+						if forwarded.err != nil || !bytes.Equal(forwarded.payload, expected) {
+							t.Fatalf("forwarded stream = %q, %v; want %q before EOF", forwarded.payload, forwarded.err, expected)
+						}
+					case <-time.After(2 * time.Second):
+						t.Fatal("target peer did not receive FIN")
+					}
+				}
+			})
+		}
+	}
+}
+
+// tcpTestReaderFunc adapts controlled stream reads to io.Reader.
+type tcpTestReaderFunc func([]byte) (int, error)
+
+// Read implements io.Reader.
+func (f tcpTestReaderFunc) Read(payload []byte) (int, error) { return f(payload) }
+
 type tcpTestWriterFunc func([]byte) (int, error)
 
 func (f tcpTestWriterFunc) Write(payload []byte) (int, error) { return f(payload) }
@@ -9088,50 +9591,63 @@ func TestTCPTimerBacklogSnapshotDoesNotGrow(t *testing.T) {
 
 // TestTCPConcurrentCloseAndDeadlines exercises socket state broadcasts while
 // Read, Write, deadline and ACK-policy changes, and Close race at the public
-// API boundary.
+// API boundary, both with and without a concurrent write half-close.
 func TestTCPConcurrentCloseAndDeadlines(t *testing.T) {
-	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
-	defer stack.Close()
-	link.echoTCP = true
-	link.dropTCPData = 1000
-	connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 9106))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var wait sync.WaitGroup
-	wait.Add(4)
-	go func() {
-		defer wait.Done()
-		_, _ = connection.Write(make([]byte, tcpSendCapacity*2))
-	}()
-	go func() {
-		defer wait.Done()
-		_, _ = connection.Read(make([]byte, 1))
-	}()
-	go func() {
-		defer wait.Done()
-		for index := 0; index < 100; index++ {
-			_ = connection.SetDeadline(time.Now().Add(time.Duration(index+1) * time.Millisecond))
-		}
-	}()
-	go func() {
-		defer wait.Done()
-		tcpConnection := connection.(*TCPConn)
-		for index := 0; index < 100; index++ {
-			_ = tcpConnection.SetQuickACK(index%2 == 0)
-		}
-	}()
-	time.Sleep(5 * time.Millisecond)
-	_ = connection.Close()
-	done := make(chan struct{})
-	go func() {
-		wait.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("concurrent socket operations did not terminate")
+	for _, name := range []string{"Close", "CloseWriteAndClose"} {
+		t.Run(name, func(t *testing.T) {
+			link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
+			defer stack.Close()
+			link.echoTCP = true
+			link.dropTCPData = 1000
+			connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 9106))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wait sync.WaitGroup
+			wait.Add(4)
+			go func() {
+				defer wait.Done()
+				_, _ = connection.Write(make([]byte, tcpSendCapacity*2))
+			}()
+			go func() {
+				defer wait.Done()
+				_, _ = connection.Read(make([]byte, 1))
+			}()
+			go func() {
+				defer wait.Done()
+				for index := 0; index < 100; index++ {
+					_ = connection.SetDeadline(time.Now().Add(time.Duration(index+1) * time.Millisecond))
+				}
+			}()
+			go func() {
+				defer wait.Done()
+				tcpConnection := connection.(*TCPConn)
+				for index := 0; index < 100; index++ {
+					_ = tcpConnection.SetQuickACK(index%2 == 0)
+				}
+			}()
+			if name == "CloseWriteAndClose" {
+				wait.Add(1)
+				go func() {
+					defer wait.Done()
+					for index := 0; index < 100; index++ {
+						_ = connection.(*TCPConn).CloseWrite()
+					}
+				}()
+			}
+			time.Sleep(5 * time.Millisecond)
+			_ = connection.Close()
+			done := make(chan struct{})
+			go func() {
+				wait.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("concurrent socket operations did not terminate")
+			}
+		})
 	}
 }
 

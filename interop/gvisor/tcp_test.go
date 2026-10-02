@@ -1705,6 +1705,176 @@ func TestTCPKeepAliveInterop(t *testing.T) {
 	}
 }
 
+// TestTCPCloseWriteBlockedWriterInterop verifies that a half-close interrupts
+// mipstack send-buffer waits without losing the accepted prefix, including
+// when its external packet reader stops. gVisor consumes that prefix and FIN
+// through its TCP socket and then sends a response in the open direction,
+// even while the application's source Reader remains blocked.
+func TestTCPCloseWriteBlockedWriterInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		for _, mipstackListens := range []bool{false, true} {
+			for _, mode := range []string{"Write", "ReadFrom", "Reader", "StoppedStackRead", "ReadFromStoppedStackRead"} {
+				direction := "gvisor-listens"
+				if mipstackListens {
+					direction = "mipstack-listens"
+				}
+				t.Run(family.name+"/"+direction+"/"+mode, func(t *testing.T) {
+					const capacity = 4096
+					paused, resume := make(chan struct{}), make(chan struct{})
+					var pauseOnce, resumeOnce sync.Once
+					network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+						families: []interopFamily{family}, mtu: 1500,
+						tcp: mipstack.TCPSocketDefaults{ReceiveBuffer: capacity, MaximumReceiveBuffer: capacity, SendBuffer: capacity, MaximumSendBuffer: capacity},
+						mipstackToGVisor: func(packet []byte) bool {
+							if mode == "StoppedStackRead" || mode == "ReadFromStoppedStackRead" {
+								_, size, ok := tcpSegment(packet)
+								if ok && size > 0 {
+									pauseOnce.Do(func() { close(paused); <-resume })
+								}
+							}
+							return true
+						},
+					})
+					resumeRead := func() { resumeOnce.Do(func() { close(resume) }) }
+					t.Cleanup(resumeRead)
+					if err := network.gvisor.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpip.TCPReceiveBufferSizeRangeOption{
+						Min: capacity, Default: capacity, Max: capacity,
+					}); err != nil {
+						t.Fatalf("gVisor receive buffer: %s", err.String())
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					client, server, listener := openTCPPair(t, ctx, network, family, mipstackListens)
+					defer listener.Close()
+					defer client.Close()
+					defer server.Close()
+					connection, peer := client, server
+					if mipstackListens {
+						connection, peer = server, client
+					}
+					sender := connection.(*mipstack.TCPConn)
+					payload := patternedPayload(64*1024, 173)
+					type writeResult struct {
+						n   int64
+						err error
+					}
+					written := make(chan writeResult, 1)
+					var pipeWriter *io.PipeWriter
+					if mode == "Reader" {
+						reader, writer := io.Pipe()
+						pipeWriter = writer
+						t.Cleanup(func() { _ = reader.Close(); _ = writer.Close() })
+						go func() {
+							n, err := sender.ReadFrom(reader)
+							written <- writeResult{n, err}
+						}()
+						payload = []byte("queued before the blocked source")
+						if n, err := writer.Write(payload); err != nil || n != len(payload) {
+							t.Fatalf("source Write = %d, %v", n, err)
+						}
+					} else {
+						go func() {
+							if mode == "ReadFrom" || mode == "ReadFromStoppedStackRead" {
+								n, err := sender.ReadFrom(bytes.NewReader(payload))
+								written <- writeResult{n, err}
+							} else {
+								n, err := sender.Write(payload)
+								written <- writeResult{int64(n), err}
+							}
+						}()
+					}
+					if mode == "StoppedStackRead" || mode == "ReadFromStoppedStackRead" {
+						select {
+						case <-paused:
+						case <-time.After(2 * time.Second):
+							t.Fatal("external packet reader did not stop")
+						}
+					}
+					ready := false
+					for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+						info := sender.Info()
+						if mode == "Reader" {
+							ready = info.BytesAcknowledged == uint64(len(payload))
+						} else {
+							ready = info.SendBufferSize == capacity &&
+								(info.PeerWindow == 0 || mode == "StoppedStackRead" || mode == "ReadFromStoppedStackRead")
+						}
+						if ready {
+							break
+						}
+						time.Sleep(time.Millisecond)
+					}
+					if !ready {
+						t.Fatalf("sender did not reach blocked state: %+v", sender.Info())
+					}
+					select {
+					case result := <-written:
+						t.Fatalf("writer returned before half-close: %+v", result)
+					default:
+					}
+					closed := make(chan error, 1)
+					go func() { closed <- sender.CloseWrite() }()
+					select {
+					case err := <-closed:
+						if err != nil {
+							t.Fatalf("CloseWrite: %v", err)
+						}
+					case <-time.After(2 * time.Second):
+						t.Fatal("CloseWrite waited for the writer")
+					}
+					var result writeResult
+					expected := payload
+					if pipeWriter == nil {
+						select {
+						case result = <-written:
+						case <-time.After(2 * time.Second):
+							t.Fatal("writer did not observe half-close")
+						}
+						if result.n <= 0 || result.n >= int64(len(payload)) || !errors.Is(result.err, net.ErrClosed) {
+							t.Fatalf("interrupted write = %d, %v", result.n, result.err)
+						}
+						expected = payload[:int(result.n)]
+					}
+					resumeRead()
+					_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+					received, err := io.ReadAll(peer)
+					if err != nil || !bytes.Equal(received, expected) {
+						t.Fatalf("gVisor accepted prefix before EOF = %d bytes, %v; want %d matching bytes", len(received), err, len(expected))
+					}
+					response := patternedPayload(512, 179)
+					if n, err := peer.Write(response); err != nil || n != len(response) {
+						t.Fatalf("gVisor reverse Write = %d, %v", n, err)
+					}
+					if err := peer.(*gonet.TCPConn).CloseWrite(); err != nil {
+						t.Fatal(err)
+					}
+					_ = sender.SetReadDeadline(time.Now().Add(5 * time.Second))
+					received, err = io.ReadAll(sender)
+					if err != nil || !bytes.Equal(received, response) {
+						t.Fatalf("mipstack reverse stream before EOF = %d bytes, %v", len(received), err)
+					}
+					if pipeWriter != nil {
+						select {
+						case result := <-written:
+							t.Fatalf("ReadFrom returned before source EOF: %+v", result)
+						default:
+						}
+						_ = pipeWriter.Close()
+						select {
+						case result = <-written:
+						case <-time.After(2 * time.Second):
+							t.Fatal("ReadFrom did not return after source EOF")
+						}
+						if result.n != int64(len(payload)) || result.err != nil {
+							t.Fatalf("ReadFrom after source EOF = %d, %v", result.n, result.err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
 // TestTCPReceiveWindowReopenInterop verifies that gVisor honors a zero window
 // advertised by mipstack and resumes after application reads reopen it.
 func TestTCPReceiveWindowReopenInterop(t *testing.T) {

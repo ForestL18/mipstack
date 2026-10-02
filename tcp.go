@@ -5465,6 +5465,8 @@ func (c *TCPConn) readChunk(destination []byte, maximum int, getBuffer func(size
 
 // WriteTo copies the receive stream into writer while preserving read
 // ordering with concurrent calls to Read. It implements io.WriterTo.
+//
+// Closing c does not cancel a blocked Write on writer.
 func (c *TCPConn) WriteTo(writer io.Writer) (int64, error) {
 	c.readCallMu.Lock()
 	defer c.readCallMu.Unlock()
@@ -5608,6 +5610,8 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 // ReadFrom copies a stream into c while preserving write ordering with
 // concurrent calls to Write. It implements io.ReaderFrom without recursively
 // entering io.Copy's ReaderFrom fast path.
+//
+// Closing c does not cancel a blocked Read on reader.
 func (c *TCPConn) ReadFrom(reader io.Reader) (int64, error) {
 	c.writeCallMu.Lock()
 	defer c.writeCallMu.Unlock()
@@ -5644,10 +5648,10 @@ func (c *TCPConn) ReadFrom(reader io.Reader) (int64, error) {
 	}
 }
 
-// CloseWrite queues FIN after all bytes already accepted by Write.
+// CloseWrite closes the send direction and queues FIN after all accepted bytes.
+// It wakes writes waiting for send-buffer space without waiting for an active
+// Write or ReadFrom to finish. The receive direction remains open.
 func (c *TCPConn) CloseWrite() error {
-	c.writeCallMu.Lock()
-	defer c.writeCallMu.Unlock()
 	c.mu.Lock()
 	if c.userClosed || c.terminalErr != nil {
 		err := c.connectionErrorLocked()
@@ -5658,7 +5662,12 @@ func (c *TCPConn) CloseWrite() error {
 		c.mu.Unlock()
 		return nil
 	}
+	// RFC 9293 sections 3.6 and 3.10.4 put accepted data before FIN; c.mu
+	// orders send-buffer appends against this boundary. Like Linux
+	// shutdown(SHUT_WR), publish closure and wake send-space waiters without
+	// waiting for an application write or an external ReadFrom Reader.
 	c.writeClosed = true
+	c.notifySendChangedLocked()
 	c.mu.Unlock()
 	c.notifySend()
 	return nil
@@ -6266,8 +6275,8 @@ func (c *TCPConn) notifySend() {
 	c.wakeActor(tcpActorWakeSend)
 }
 
-// notifySendChangedLocked wakes Writes waiting for send-buffer space while
-// c.mu is held.
+// notifySendChangedLocked wakes the serialized writer after send capacity or
+// write-side state changes. The caller holds c.mu.
 func (c *TCPConn) notifySendChangedLocked() {
 	if c.sendChanged == nil {
 		return

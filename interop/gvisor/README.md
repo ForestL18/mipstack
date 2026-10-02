@@ -14,7 +14,8 @@ The suite covers:
 - IPv4 MTUs 68, 576, 1,280, 1,420, 1,500, and 9,000, plus IPv6 MTUs 1,280,
   1,420, 1,500, and 9,000;
 - IPv4 and IPv6 TCP with either stack listening, simultaneous streams,
-  half-close processing, wildcard dual-stack listeners, closed-port and
+  half-close processing with blocked writers and paused packet reads,
+  wildcard dual-stack listeners, closed-port and
   established-connection resets, keepalive restart after bidirectional data,
   receive-window closure and reopening, SYN, SYN-ACK, final-ACK, FIN, and data
   retransmission after deterministic loss or reordering;
