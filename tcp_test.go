@@ -764,6 +764,117 @@ func TestTCPUserTimeoutOverridesKeepAliveCount(t *testing.T) {
 	}
 }
 
+func TestTCPKeepAliveUserTimeoutWaitsForProbeInterval(t *testing.T) {
+	for _, mode := range []string{"silent peer", "acknowledged probe", "outstanding data"} {
+		t.Run(mode, func(t *testing.T) {
+			link, stack, connection := newManuallyPumpedTCPConnection(t)
+			defer connection.Close()
+			keepAlive := KeepAliveConfig{Idle: 150 * time.Millisecond, Interval: 500 * time.Millisecond, Count: 1}
+			if err := connection.SetKeepAliveConfig(keepAlive); err != nil {
+				t.Fatal(err)
+			}
+			if err := connection.SetUserTimeout(100 * time.Millisecond); err != nil {
+				t.Fatal(err)
+			}
+			if err := connection.SetKeepAlive(true); err != nil {
+				t.Fatal(err)
+			}
+			entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+			if !available {
+				t.Fatal("initial keepalive probe was not published")
+			}
+			probeAt := time.Now()
+			wire := consumeTestPacket(&stack.outbound, entry)
+			packet, valid := parseIPPacket(wire, false)
+			if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize || int(packet.payload[12]>>4)*4 != len(packet.payload) || packet.payload[13] != TCPFlagACK {
+				t.Fatalf("initial output is not a keepalive ACK: %x", wire)
+			}
+			clientPort := uint16(connection.LocalAddr().(*net.TCPAddr).Port)
+			link.mu.Lock()
+			peer := link.tcp[clientPort]
+			sequence, acknowledgement := peer.serverNext, peer.clientNext
+			link.mu.Unlock()
+			if binary.BigEndian.Uint32(packet.payload[4:8]) != acknowledgement-1 || binary.BigEndian.Uint32(packet.payload[8:12]) != sequence {
+				t.Fatalf("initial output does not use SND.NXT-1: %x", wire)
+			}
+			select {
+			case <-connection.done:
+				t.Fatalf("connection closed before the next keepalive check: %+v", connection.Info())
+			case <-time.After(keepAlive.Interval / 5):
+			}
+
+			if mode == "acknowledged probe" {
+				if err := link.deliverTCP(8080, clientPort, sequence, acknowledgement, TCPFlagACK, 65535, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+				entry, available = waitTestPacketEntry(&stack.outbound, (keepAlive.Idle+keepAlive.Interval)/2)
+				if !available {
+					t.Fatal("keepalive ACK did not restart the probe series with Idle")
+				}
+				wire = consumeTestPacket(&stack.outbound, entry)
+				packet, valid = parseIPPacket(wire, false)
+				if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize || int(packet.payload[12]>>4)*4 != len(packet.payload) || packet.payload[13] != TCPFlagACK || binary.BigEndian.Uint32(packet.payload[4:8]) != acknowledgement-1 {
+					t.Fatalf("output after keepalive ACK is not a new probe: %x", wire)
+				}
+				if err := link.deliverTCP(8080, clientPort, sequence, acknowledgement, TCPFlagACK, 65535, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+				payload := []byte("usable after keepalive ACK")
+				_ = connection.SetDeadline(time.Now().Add(time.Second))
+				if n, err := connection.Write(payload); err != nil || n != len(payload) {
+					t.Fatalf("Write after keepalive ACK = %d, %v", n, err)
+				}
+				entry, available = waitTestPacketEntry(&stack.outbound, time.Second)
+				if !available {
+					t.Fatal("application output was not published after keepalive ACK")
+				}
+				if err := link.handleOutboundPacket(consumeTestPacket(&stack.outbound, entry)); err != nil {
+					t.Fatal(err)
+				}
+				received := make([]byte, len(payload))
+				if _, err := io.ReadFull(connection, received); err != nil || !bytes.Equal(received, payload) {
+					t.Fatalf("echo after keepalive ACK = %q, %v", received, err)
+				}
+				if info := connection.Info(); info.State != TCPStateEstablished || info.LastError != nil {
+					t.Fatalf("acknowledged keepalive connection = %+v", info)
+				}
+				return
+			}
+
+			if mode == "outstanding data" {
+				if _, err := connection.Write([]byte("unacknowledged after probe")); err != nil {
+					t.Fatal(err)
+				}
+				entry, available = waitTestPacketEntry(&stack.outbound, time.Second)
+				if !available {
+					t.Fatal("application output was not published after keepalive probe")
+				}
+				wire = consumeTestPacket(&stack.outbound, entry)
+				packet, valid = parseIPPacket(wire, false)
+				if !valid || packet.protocol != ProtocolTCP || len(packet.payload) <= tcpHeaderSize || int(packet.payload[12]>>4)*4 >= len(packet.payload) {
+					t.Fatalf("expected outstanding application data, got %x", wire)
+				}
+				select {
+				case <-connection.done:
+					t.Fatalf("stale keepalive activity expired a new flight: %+v", connection.Info())
+				case <-time.After(25 * time.Millisecond):
+				}
+			}
+			select {
+			case <-connection.done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("unanswered connection did not reach its user timeout")
+			}
+			if mode == "silent peer" && time.Since(probeAt) < keepAlive.Interval*3/4 {
+				t.Fatalf("silent peer closed %v after its first probe, before the next check", time.Since(probeAt))
+			}
+			if info := connection.Info(); !errors.Is(info.LastError, syscall.ETIMEDOUT) || stack.Stats().TCPKeepAliveProbes != 1 {
+				t.Fatalf("keepalive user timeout = info:%+v stats:%+v", info, stack.Stats())
+			}
+		})
+	}
+}
+
 func TestTCPFullDuplexSustainedTrafficHasNoLocalDrops(t *testing.T) {
 	clientAddress := netip.MustParseAddr("192.0.2.142")
 	serverAddress := netip.MustParseAddr("192.0.2.143")
@@ -4874,10 +4985,14 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 		name              string
 		inboundActivity   bool
 		applicationOutput bool
+		closeWrite        bool
+		userTimeout       bool
 	}{
 		{name: "returned capacity publishes probe"},
 		{name: "inbound activity cancels probe", inboundActivity: true},
 		{name: "application output cancels probe", applicationOutput: true},
+		{name: "CloseWrite cancels probe", closeWrite: true},
+		{name: "delayed first probe with user timeout", userTimeout: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			link, stack, connection := newManuallyPumpedTCPConnection(t)
@@ -4907,8 +5022,16 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 			}
 
 			keepAlive := KeepAliveConfig{Idle: 100 * time.Millisecond, Interval: 100 * time.Millisecond, Count: 3}
+			if test.userTimeout {
+				keepAlive.Interval = 300 * time.Millisecond
+			}
 			if err := connection.SetKeepAliveConfig(keepAlive); err != nil {
 				t.Fatal(err)
+			}
+			if test.userTimeout {
+				if err := connection.SetUserTimeout(75 * time.Millisecond); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := connection.SetKeepAlive(true); err != nil {
 				t.Fatal(err)
@@ -4958,6 +5081,12 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 				}
 				_ = connection.Info()
 				_ = connection.Info()
+			} else if test.closeWrite {
+				if err := connection.CloseWrite(); err != nil {
+					t.Fatal(err)
+				}
+				_ = connection.Info()
+				_ = connection.Info()
 			}
 
 			last := len(held) - 1
@@ -4985,6 +5114,13 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 				if probes := stack.Stats().TCPKeepAliveProbes; probes != 0 {
 					t.Fatalf("application-canceled keepalive probes = %d, want 0", probes)
 				}
+			} else if test.closeWrite {
+				if gotSequence != acknowledgement || headerSize != len(packet.payload) || packet.payload[13] != TCPFlagACK|TCPFlagFIN {
+					t.Fatalf("CloseWrite did not replace keepalive probe with FIN: %x", wire)
+				}
+				if probes := stack.Stats().TCPKeepAliveProbes; probes != 0 {
+					t.Fatalf("CloseWrite-canceled keepalive probes = %d, want 0", probes)
+				}
 			} else if test.inboundActivity {
 				if headerSize != len(packet.payload) {
 					t.Fatalf("activity response is not a payload-free ACK: %x", wire)
@@ -5003,6 +5139,165 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 					t.Fatalf("resumed output is not the current keepalive probe: %x", wire)
 				}
 				waitFor(t, time.Second, func() bool { return stack.Stats().TCPKeepAliveProbes == 1 })
+				if test.userTimeout {
+					select {
+					case <-connection.done:
+						t.Fatalf("delayed first publication caused an immediate timeout: %+v", connection.Info())
+					case <-time.After(keepAlive.Interval / 3):
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestTCPKeepAliveCapacityRetryHonorsUserTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		expired           bool
+		applicationOutput bool
+		closeWrite        bool
+		concurrentOutput  bool
+	}{
+		{name: "before timeout"},
+		{name: "after timeout", expired: true},
+		{name: "queued Write supersedes expired idle timeout", expired: true, applicationOutput: true},
+		{name: "queued FIN supersedes expired idle timeout", expired: true, closeWrite: true},
+		{name: "Write wake races returned capacity", expired: true, applicationOutput: true, concurrentOutput: true},
+		{name: "CloseWrite wake races returned capacity", expired: true, closeWrite: true, concurrentOutput: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, stack, connection := newManuallyPumpedTCPConnection(t)
+			defer connection.Close()
+			keepAlive := KeepAliveConfig{Idle: 100 * time.Millisecond, Interval: 600 * time.Millisecond, Count: 20}
+			userTimeout := 2 * time.Second
+			if err := connection.SetKeepAliveConfig(keepAlive); err != nil {
+				t.Fatal(err)
+			}
+			if err := connection.SetUserTimeout(userTimeout); err != nil {
+				t.Fatal(err)
+			}
+			if err := connection.SetKeepAlive(true); err != nil {
+				t.Fatal(err)
+			}
+			entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+			if !available {
+				t.Fatal("initial keepalive probe was not published")
+			}
+			wire := consumeTestPacket(&stack.outbound, entry)
+			initial, valid := parseIPPacket(wire, false)
+			if !valid || initial.protocol != ProtocolTCP || len(initial.payload) < tcpHeaderSize || int(initial.payload[12]>>4)*4 != len(initial.payload) || initial.payload[13] != TCPFlagACK {
+				t.Fatalf("initial output is not a keepalive ACK: %x", wire)
+			}
+			waitFor(t, time.Second, func() bool { return stack.Stats().TCPKeepAliveProbes == 1 })
+
+			held := make([]uint16, 0, cap(stack.outbound.free))
+			defer func() {
+				for _, slot := range held {
+					stack.outbound.releaseReserved(slot)
+				}
+			}()
+			for {
+				slot, reserved := stack.outbound.tryReserve()
+				if !reserved {
+					break
+				}
+				held = append(held, slot)
+			}
+			if len(held) != cap(stack.outbound.free) {
+				t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+			}
+			time.Sleep(keepAlive.Interval + 100*time.Millisecond)
+			_ = connection.Info()
+			_ = connection.Info()
+
+			payload := []byte("new application output")
+			if test.applicationOutput {
+				if n, err := connection.Write(payload); err != nil || n != len(payload) {
+					t.Fatalf("Write = %d, %v", n, err)
+				}
+			} else if test.closeWrite {
+				if err := connection.CloseWrite(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The race cases leave the send wake unsequenced with capacity recovery.
+			// Publication must use current output state in either actor-event order.
+			if !test.concurrentOutput {
+				_ = connection.Info()
+				_ = connection.Info()
+			}
+
+			// Pause publication on the connection lock across the idle deadline.
+			// Capacity-only cases confirm ownership of the returned slot. A send
+			// wake may instead win the race and block before acquiring that slot;
+			// queued data or FIN must survive the idle deadline in either order.
+			connection.mu.Lock()
+			locked := true
+			defer func() {
+				if locked {
+					connection.mu.Unlock()
+				}
+			}()
+			last := len(held) - 1
+			stack.outbound.releaseReserved(held[last])
+			held = held[:last]
+			if !test.concurrentOutput {
+				waitFor(t, time.Second, func() bool { return len(stack.outbound.free) == 0 })
+			}
+			if test.expired {
+				time.Sleep(userTimeout)
+			}
+			connection.mu.Unlock()
+			locked = false
+
+			if test.expired && !test.applicationOutput && !test.closeWrite {
+				select {
+				case <-connection.done:
+				case <-time.After(keepAlive.Interval / 2):
+					t.Fatalf("capacity retry postponed an expired user timeout: %+v", connection.Info())
+				}
+				if info := connection.Info(); !errors.Is(info.LastError, syscall.ETIMEDOUT) || stack.Stats().TCPKeepAliveProbes != 1 {
+					t.Fatalf("expired capacity retry = info:%+v stats:%+v", info, stack.Stats())
+				}
+				for entry, available := stack.outbound.tryDequeue(); available; entry, available = stack.outbound.tryDequeue() {
+					stack.outbound.release(entry)
+				}
+				if free := len(stack.outbound.free); free != cap(stack.outbound.free)-len(held) {
+					t.Fatalf("free output slots after timeout = %d, want %d", free, cap(stack.outbound.free)-len(held))
+				}
+				return
+			}
+			entry, available = waitTestPacketEntry(&stack.outbound, keepAlive.Interval/2)
+			if !available {
+				t.Fatal("capacity retry did not publish the expected TCP output")
+			}
+			wire = consumeTestPacket(&stack.outbound, entry)
+			packet, valid := parseIPPacket(wire, false)
+			if test.applicationOutput || test.closeWrite {
+				if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+					t.Fatalf("capacity retry did not publish TCP: %x", wire)
+				}
+				headerSize := int(packet.payload[12]>>4) * 4
+				if headerSize < tcpHeaderSize || headerSize > len(packet.payload) || binary.BigEndian.Uint32(packet.payload[4:8]) != binary.BigEndian.Uint32(initial.payload[4:8])+1 {
+					t.Fatalf("invalid resumed sequence space: %x", wire)
+				}
+				if test.applicationOutput && !bytes.Equal(packet.payload[headerSize:], payload) || test.closeWrite && (headerSize != len(packet.payload) || packet.payload[13] != TCPFlagACK|TCPFlagFIN) {
+					t.Fatalf("queued data or FIN did not supersede idle probe: %x", wire)
+				}
+				if info := connection.Info(); info.LastError != nil || stack.Stats().TCPKeepAliveProbes != 1 {
+					t.Fatalf("idle timeout consumed queued output: info:%+v stats:%+v", info, stack.Stats())
+				}
+				if free := len(stack.outbound.free); free != cap(stack.outbound.free)-len(held) {
+					t.Fatalf("free output slots after resumed output = %d, want %d", free, cap(stack.outbound.free)-len(held))
+				}
+				return
+			}
+			if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize || int(packet.payload[12]>>4)*4 != len(packet.payload) || packet.payload[13] != TCPFlagACK || !bytes.Equal(packet.payload[4:12], initial.payload[4:12]) {
+				t.Fatalf("capacity retry is not the current keepalive probe: %x", wire)
+			}
+			if info := connection.Info(); info.State != TCPStateEstablished || info.LastError != nil || stack.Stats().TCPKeepAliveProbes != 2 {
+				t.Fatalf("unexpired capacity retry = info:%+v stats:%+v", info, stack.Stats())
 			}
 		})
 	}
@@ -8256,6 +8551,73 @@ func TestTCPLivenessDeadlineTracksActivity(t *testing.T) {
 	state.armLiveness(false)
 	if want := secondActivity.Add(idle); !state.liveness || state.livenessDeadline != want {
 		t.Fatalf("rearmed liveness = %t at %v, want true at %v", state.liveness, state.livenessDeadline, want)
+	}
+}
+
+func TestTCPLivenessKeepAliveUserTimeoutDeadline(t *testing.T) {
+	activity := time.Unix(1700000000, 0)
+	for _, test := range []struct {
+		name          string
+		userTimeout   time.Duration
+		idleTimeout   time.Duration
+		probed        bool
+		pending       bool
+		disabled      bool
+		outstanding   bool
+		zeroWindow    bool
+		deadlineAfter time.Duration
+	}{
+		{name: "first probe short timeout", userTimeout: 5 * time.Second, deadlineAfter: 30 * time.Second},
+		{name: "first probe equal timeout", userTimeout: 30 * time.Second, deadlineAfter: 30 * time.Second},
+		{name: "first probe long timeout", userTimeout: 45 * time.Second, deadlineAfter: 30 * time.Second},
+		{name: "after probe short timeout", userTimeout: 5 * time.Second, probed: true, deadlineAfter: 40 * time.Second},
+		{name: "after probe idle timeout", userTimeout: 30 * time.Second, probed: true, deadlineAfter: 40 * time.Second},
+		{name: "after probe between checks", userTimeout: 35 * time.Second, probed: true, deadlineAfter: 40 * time.Second},
+		{name: "after probe at check", userTimeout: 40 * time.Second, probed: true, deadlineAfter: 40 * time.Second},
+		{name: "after probe later timeout", userTimeout: 45 * time.Second, probed: true, deadlineAfter: 40 * time.Second},
+		{name: "pending first probe", userTimeout: 5 * time.Second, pending: true},
+		{name: "pending after probe short timeout", userTimeout: 5 * time.Second, probed: true, pending: true, deadlineAfter: 40 * time.Second},
+		{name: "pending after probe between checks", userTimeout: 35 * time.Second, probed: true, pending: true, deadlineAfter: 40 * time.Second},
+		{name: "pending after probe later timeout", userTimeout: 45 * time.Second, probed: true, pending: true, deadlineAfter: 45 * time.Second},
+		{name: "pending without user timeout", probed: true, pending: true},
+		{name: "disabled after probe", userTimeout: 5 * time.Second, probed: true, disabled: true},
+		{name: "disabled pending probe", userTimeout: 5 * time.Second, probed: true, pending: true, disabled: true},
+		{name: "independent idle timeout", userTimeout: 5 * time.Second, idleTimeout: 35 * time.Second, probed: true, deadlineAfter: 35 * time.Second},
+		{name: "pending independent idle timeout", userTimeout: 45 * time.Second, idleTimeout: 35 * time.Second, probed: true, pending: true, deadlineAfter: 35 * time.Second},
+		{name: "outstanding data", userTimeout: 5 * time.Second, probed: true, outstanding: true, deadlineAfter: 37 * time.Second},
+		{name: "pending outstanding data", userTimeout: 5 * time.Second, probed: true, pending: true, outstanding: true, deadlineAfter: 37 * time.Second},
+		{name: "zero window", userTimeout: 5 * time.Second, probed: true, zeroWindow: true, deadlineAfter: 37 * time.Second},
+		{name: "pending zero window", userTimeout: 5 * time.Second, probed: true, pending: true, zeroWindow: true, deadlineAfter: 37 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			connection := &TCPConn{
+				stack:           &Stack{timestampEpoch: activity},
+				keepAlive:       !test.disabled,
+				keepAliveConfig: KeepAliveConfig{Idle: 30 * time.Second, Interval: 10 * time.Second, Count: 3},
+				userTimeout:     test.userTimeout,
+				idleTimeout:     test.idleTimeout,
+			}
+			state := tcpEstablishedState{connection: connection, lastActivity: activity, peerWindow: 65535}
+			if test.probed {
+				state.livenessState = &tcpEstablishedLivenessState{keepAliveProbes: 1, lastKeepAlive: activity.Add(30 * time.Second)}
+			}
+			if test.outstanding {
+				state.outstanding = []sentTCPSegment{{firstSent: 32 * time.Second}}
+			}
+			if test.zeroWindow {
+				connection.sendBuffer.append([]byte("blocked"))
+				state.peerWindow = 0
+				state.livenessState.zeroWindowSince = activity.Add(32 * time.Second)
+			}
+			state.armLiveness(test.pending)
+			var want time.Time
+			if test.deadlineAfter != 0 {
+				want = activity.Add(test.deadlineAfter)
+			}
+			if state.liveness != !want.IsZero() || !state.livenessDeadline.Equal(want) {
+				t.Fatalf("liveness = %t at %v, want %t at %v", state.liveness, state.livenessDeadline, !want.IsZero(), want)
+			}
+		})
 	}
 }
 

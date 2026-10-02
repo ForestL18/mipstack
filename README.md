@@ -1072,7 +1072,9 @@ TCP user timeout follows Linux `TCP_USER_TIMEOUT`: it applies only in
 synchronized states, returns `ETIMEDOUT`, does not change retransmission or
 keepalive probe timing, and bounds data that remains unacknowledged or unsent
 behind a zero window. Retransmission does not restart the absolute deadline.
-When keepalive is enabled, user timeout replaces the probe-count close policy.
+When keepalive is enabled, user timeout replaces the probe-count close policy
+and is checked before a subsequent probe, after at least one probe has been
+sent and its interval has elapsed.
 MIPS treats it as a local socket policy and does not advertise the optional
 RFC 5482 UTO option.
 

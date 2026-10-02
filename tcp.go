@@ -2761,9 +2761,9 @@ func (s *tcpEstablishedState) armPathMTUProbe() {
 }
 
 // armLiveness selects the earliest idle, user-timeout, zero-window, or
-// keepalive deadline without allocating state for inactive policies. A
-// keepalive already waiting for output capacity is excluded without suppressing
-// the independent timeout policies.
+// keepalive deadline without allocating state for inactive policies. A probe
+// waiting for output capacity retains only its terminal user-timeout deadline;
+// capacity notifications resume publication without periodic retries.
 func (s *tcpEstablishedState) armLiveness(keepAliveOutputPending bool) {
 	s.liveness = false
 	s.livenessDeadline = time.Time{}
@@ -2782,16 +2782,23 @@ func (s *tcpEstablishedState) armLiveness(keepAliveOutputPending bool) {
 	} else if s.livenessState != nil {
 		s.livenessState.zeroWindowSince = time.Time{}
 	}
-	if options.userTimeout > 0 && s.livenessState != nil && s.livenessState.keepAliveProbes != 0 {
-		keepAliveUserDeadline := s.lastActivity.Add(options.userTimeout)
-		if deadline.IsZero() || keepAliveUserDeadline.Before(deadline) {
-			deadline = keepAliveUserDeadline
-		}
-	}
 	if !keepAliveOutputPending && options.keepAlive && s.keepAliveEligible() {
+		// Linux tcp_keepalive_timer tests TCP_USER_TIMEOUT at a due probe
+		// check, before transmission. A published probe therefore gets its
+		// full Interval even when the inactivity timeout has already elapsed.
 		keepAliveDeadline := s.lastActivity.Add(options.keepAliveConfig.Idle)
 		if s.livenessState != nil && s.livenessState.keepAliveProbes != 0 {
 			keepAliveDeadline = s.livenessState.lastKeepAlive.Add(options.keepAliveConfig.Interval)
+		}
+		if deadline.IsZero() || keepAliveDeadline.Before(deadline) {
+			deadline = keepAliveDeadline
+		}
+	} else if keepAliveOutputPending && options.keepAlive && options.userTimeout > 0 && s.livenessState != nil && s.livenessState.keepAliveProbes != 0 {
+		// A blocked output queue must neither shorten the previous probe's
+		// Interval nor suppress the eventual timeout while capacity is absent.
+		keepAliveDeadline := s.livenessState.lastKeepAlive.Add(options.keepAliveConfig.Interval)
+		if userDeadline := s.lastActivity.Add(options.userTimeout); userDeadline.After(keepAliveDeadline) {
+			keepAliveDeadline = userDeadline
 		}
 		if deadline.IsZero() || keepAliveDeadline.Before(deadline) {
 			deadline = keepAliveDeadline
@@ -8339,27 +8346,45 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		return nil
 	}
 	// drainKeepAliveOutput publishes one due idle-peer probe. The readiness bit
-	// retains no sequence or packet state; every attempt derives current wire
-	// fields only after it owns device capacity.
+	// retains no sequence or packet state; each attempt completes socket-state
+	// reads before its terminal check and publishes only with owned capacity.
 	drainKeepAliveOutput := func(first tcpOutputReservation) error {
 		outputWindow := newTCPOutputWindow(first)
 		if !keepAliveOutputWaiting {
 			outputWindow.release()
 			return nil
 		}
-		options := c.socketOptions()
-		if !options.keepAlive || !state.keepAliveEligible() {
+		window, right := state.nextAdvertisedReceiveWindow()
+		// Linux tcp_keepalive_timer tests queued output and the terminal policy
+		// under the socket lock. Keep these reads together so a newly queued
+		// Write or FIN cannot be mistaken for an idle, failed peer.
+		c.mu.Lock()
+		if !c.keepAlive || len(state.outstanding) != 0 || int(state.sendNext-state.sendUnacknowledged) < c.sendBuffer.size || c.writeClosed && !state.localFINSent {
+			c.mu.Unlock()
 			keepAliveOutputWaiting = false
 			outputWindow.release()
 			return nil
 		}
+		// Like Linux tcp_keepalive_timer, test the terminal policy before each
+		// due probe, including capacity retries. Queue or socket-lock waits must
+		// not restart an expired inactivity timeout. RFC 9293 section 3.8.4
+		// warns that one unanswered probe alone does not establish peer failure.
+		if liveness := state.livenessState; liveness != nil {
+			userExpired := c.userTimeout > 0 && liveness.keepAliveProbes != 0 && !time.Now().Before(state.lastActivity.Add(c.userTimeout))
+			countExpired := c.userTimeout == 0 && liveness.keepAliveProbes >= c.keepAliveConfig.Count
+			if userExpired || countExpired {
+				c.mu.Unlock()
+				outputWindow.release()
+				return syscall.ETIMEDOUT
+			}
+		}
+		c.mu.Unlock()
 		reservation, outputWindow, available := outputWindow.reserve(c)
 		if !available {
 			outputWindow.release()
 			return nil
 		}
 		probeSequence := state.sendNext - 1
-		window, right := state.nextAdvertisedReceiveWindow()
 		var payload tcpPayloadView
 		sequenceRange := tcpOutputSequenceRange{}
 		if probeSequence-state.sendUnacknowledged > state.sendNext-state.sendUnacknowledged {
@@ -9218,18 +9243,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			if deadline := state.userTimeoutDeadline(now, options.userTimeout); !deadline.IsZero() && !now.Before(deadline) {
 				return syscall.ETIMEDOUT
 			}
-			if options.userTimeout > 0 && state.livenessState != nil && state.livenessState.keepAliveProbes != 0 && !now.Before(state.lastActivity.Add(options.userTimeout)) {
-				return syscall.ETIMEDOUT
-			}
 			if options.keepAlive && state.keepAliveEligible() {
 				deadline := state.lastActivity.Add(options.keepAliveConfig.Idle)
 				if state.livenessState != nil && state.livenessState.keepAliveProbes != 0 {
 					deadline = state.livenessState.lastKeepAlive.Add(options.keepAliveConfig.Interval)
 				}
 				if !now.Before(deadline) {
-					if options.userTimeout == 0 && state.livenessState != nil && state.livenessState.keepAliveProbes >= options.keepAliveConfig.Count {
-						return syscall.ETIMEDOUT
-					}
 					keepAliveOutputWaiting = true
 					if err := drainKeepAliveOutput(tcpOutputReservation{}); err != nil {
 						return err

@@ -1705,6 +1705,100 @@ func TestTCPKeepAliveInterop(t *testing.T) {
 	}
 }
 
+// TestTCPKeepAliveUserTimeoutInterop verifies that a native gVisor ACK can
+// recover a probe whose user timeout already elapsed, and that a withheld ACK
+// closes the connection only at the next keepalive check.
+func TestTCPKeepAliveUserTimeoutInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mipstackListens := range []bool{false, true} {
+			mipstackListens := mipstackListens
+			for _, silent := range []bool{false, true} {
+				silent := silent
+				direction, response := "gvisor-listens", "acknowledged"
+				if mipstackListens {
+					direction = "mipstack-listens"
+				}
+				if silent {
+					response = "silent"
+				}
+				t.Run(family.name+"/"+direction+"/"+response, func(t *testing.T) {
+					keepAlive := mipstack.KeepAliveConfig{Idle: 150 * time.Millisecond, Interval: 500 * time.Millisecond, Count: 1}
+					observer := newTCPKeepAliveObserver()
+					ackHeld, release := make(chan struct{}), make(chan struct{})
+					var releaseOnce sync.Once
+					held := false
+					var probe tcpKeepAliveObservation
+					network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+						families: []interopFamily{family}, mtu: 1500,
+						tcp:              mipstack.TCPSocketDefaults{KeepAlive: true, KeepAliveConfig: keepAlive, UserTimeout: 100 * time.Millisecond},
+						mipstackToGVisor: observer.observeOutbound,
+						gvisorToMipstack: func(packet []byte) bool {
+							tcpHeader, size, ok := tcpSegment(packet)
+							if ok && size == 0 && tcpHeader.Flags() == header.TCPFlagAck && !held {
+								select {
+								case probe = <-observer.probes:
+									held = true
+									close(ackHeld)
+									if silent {
+										return false
+									}
+									<-release
+								default:
+								}
+							}
+							return observer.observeInbound(packet)
+						},
+					})
+					t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					client, server, listener := openTCPPair(t, ctx, network, family, mipstackListens)
+					defer listener.Close()
+					defer client.Close()
+					defer server.Close()
+					connection, ok := client.(*mipstack.TCPConn)
+					if !ok {
+						connection = server.(*mipstack.TCPConn)
+					}
+					select {
+					case <-ackHeld:
+					case <-time.After(2 * time.Second):
+						t.Fatalf("gVisor did not acknowledge the keepalive probe; info=%+v", connection.Info())
+					}
+					time.Sleep(keepAlive.Interval / 5)
+					if info := connection.Info(); info.State != mipstack.TCPStateEstablished || info.LastError != nil {
+						t.Fatalf("connection closed before the next keepalive check: %+v", info)
+					}
+					if silent {
+						_ = connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+						var buffer [1]byte
+						if n, err := connection.Read(buffer[:]); n != 0 || !errors.Is(err, syscall.ETIMEDOUT) {
+							t.Fatalf("silent keepalive Read = %d, %v, want ETIMEDOUT", n, err)
+						}
+						if elapsed := observer.elapsed() - probe.sentAt; elapsed < keepAlive.Interval*3/4 {
+							t.Fatalf("silent peer closed %v after the probe, before the next check", elapsed)
+						}
+						if probes := network.mipstack.Stats().TCPKeepAliveProbes; probes != 1 {
+							t.Fatalf("published keepalive probes = %d, want 1", probes)
+						}
+						return
+					}
+					releaseOnce.Do(func() { close(release) })
+					select {
+					case <-observer.probes:
+					case <-time.After((keepAlive.Idle + keepAlive.Interval) / 2):
+						t.Fatalf("gVisor ACK did not restart the probe series with Idle; info=%+v", connection.Info())
+					}
+					exchangeTCPPayload(t, client, server, patternedPayload(32*1024, 29))
+					exchangeTCPPayload(t, server, client, patternedPayload(32*1024, 71))
+					exerciseFullDuplexTCP(t, client, server, 16*1024)
+				})
+			}
+		}
+	}
+}
+
 // TestTCPCloseWriteBlockedWriterInterop verifies that a half-close interrupts
 // mipstack send-buffer waits without losing the accepted prefix, including
 // when its external packet reader stops. gVisor consumes that prefix and FIN
