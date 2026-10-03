@@ -186,13 +186,14 @@ const (
 	// tcpTimeWaitDuration retains a completed tuple for twice the conventional
 	// 30-second maximum segment lifetime.
 	tcpTimeWaitDuration = 60 * time.Second
-	// tcpPAWSMaxAge is the RFC 7323 lifetime for this stack's fixed millisecond
-	// TSval clock. After 24 days without a newer timestamp, a lower TSval no
-	// longer proves that a segment is stale because the clock may have wrapped.
-	tcpPAWSMaxAge = 24 * 24 * time.Hour
+	// tcpPAWSMaxAge bounds TS.Recent validity as required by RFC 7323 section
+	// 5.5. The peer's timestamp clock is independent of ours; Linux's
+	// TCP_PAWS_WRAP bound covers clocks up to 1 MHz before their sign bit wraps.
+	// This relaxes PAWS earlier than the RFC's conventional 24-day bound while
+	// leaving ordinary sequence and ACK admission in force.
+	tcpPAWSMaxAge = (1<<31 - 1) / 1_000_000 * time.Second
 	// tcpPAWSReplayWindow is Linux's TCP_PAWS_WINDOW allowance for established
-	// segments. The stack timestamp clock advances in milliseconds, so one replay
-	// tick is one millisecond.
+	// segments, measured in peer timestamp ticks rather than local clock units.
 	tcpPAWSReplayWindow uint32 = 1
 	// tcpFINWaitDuration bounds orphaned FIN_WAIT_2 resource retention. A
 	// connection retained by an application after CloseWrite has no such
@@ -4720,10 +4721,10 @@ func (s *Stack) tcpTimestampAt(now time.Time) uint32 {
 	return uint32(now.Sub(s.timestampEpoch)/time.Millisecond) + 1
 }
 
-// tcpPAWSReject applies RFC 7323's serial-number check and this stack's
-// 24-day lifetime, with Linux's zero-TS.Recent and caller-selected
-// replay-window allowances. The stack uses a fixed millisecond TSval clock;
-// Linux uses the more conservative TCP_PAWS_WRAP bound to cover faster clocks.
+// tcpPAWSReject applies RFC 7323's serial-number check with Linux's
+// zero-TS.Recent, expiry, and caller-selected replay-window allowances.
+// Section 5.5 permits deferring the age check until the comparison fails;
+// expiry removes the PAWS rejection, not ordinary TCP admission checks.
 func tcpPAWSReject(tsval, recent uint32, recentAt, receivedAt time.Time, replayWindow uint32) bool {
 	if recent == 0 || int32(recent-tsval) <= int32(replayWindow) {
 		return false
@@ -4731,11 +4732,10 @@ func tcpPAWSReject(tsval, recent uint32, recentAt, receivedAt time.Time, replayW
 	return receivedAt.Sub(recentAt) < tcpPAWSMaxAge
 }
 
-// tcpPAWSReplayTicks converts the current RTO to the millisecond timestamp
-// replay allowance Linux uses for reordered duplicate ACKs. Linux budgets for
-// peers whose timestamp clock runs at up to 1200 Hz; the stack's millisecond
-// clock therefore uses 6/5 of the RTO. It is evaluated only after the ordinary
-// PAWS check rejects a packet.
+// tcpPAWSReplayTicks converts the current RTO to Linux's traditional allowance
+// for reordered duplicate ACKs from peers with timestamp clocks up to 1200 Hz.
+// It does not infer the peer's frequency from the local clock and is evaluated
+// only after the ordinary PAWS check rejects a packet.
 func tcpPAWSReplayTicks(rto time.Duration) uint32 {
 	ticks := uint64(rto / time.Millisecond)
 	ticks += ticks / 5

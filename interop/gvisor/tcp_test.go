@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -324,6 +325,139 @@ func TestTCPMissingTimestampInterop(t *testing.T) {
 	}
 }
 
+// TestTCPHighFrequencyTimestampInterop translates gVisor's millisecond TSval
+// to a microsecond-scale clock crossing zero, and translates echoed values
+// back before gVisor receives them. Application reads verify stale-data
+// rejection and recovery through a real gVisor retransmission. Long-idle
+// TS.Recent expiry is covered separately by mipstack's arrival-time tests.
+func TestTCPHighFrequencyTimestampInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mipstackListens := range []bool{false, true} {
+			mipstackListens := mipstackListens
+			t.Run(fmt.Sprintf("%s/listens-%t", family.name, mipstackListens), func(t *testing.T) {
+				var mu sync.Mutex
+				var initial, last, stale uint32
+				var initialized, rejectData bool
+				var wraps, stalePackets, rewriteFailures int
+				originals := make(map[uint32]uint32)
+				staleSent := make(chan struct{}, 1)
+				network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+					families: []interopFamily{family}, mtu: 1500,
+					gvisorToMipstack: func(packet []byte) bool {
+						tcpHeader, payloadLength, ok := tcpSegment(packet)
+						if !ok || !tcpHeader.ParsedOptions().TS {
+							return true
+						}
+						mu.Lock()
+						defer mu.Unlock()
+						// Keep retries off the wire until the application has checked
+						// rejection. Repeatedly corrupting them would create an
+						// artificial duplicate-ACK/fast-retransmit feedback loop.
+						if rejectData && payloadLength != 0 && stalePackets != 0 {
+							return false
+						}
+						if rejectData && payloadLength != 0 {
+							// Give the stale segment a distinct payload so an erroneous late
+							// delivery cannot look like gVisor's unmodified retransmission.
+							tcpHeader.Payload()[0] ^= 0x80
+						}
+						if !rewriteTCPTimestamps(packet, func(value, echo uint32) (uint32, uint32) {
+							if !initialized {
+								initial = value
+								initialized = true
+							}
+							mapped := ^uint32(0) - 999 + (value-initial)*1000
+							if int32(mapped-last) > 0 && mapped < last {
+								wraps++
+							}
+							last = mapped
+							if rejectData && payloadLength != 0 {
+								mapped = stale
+								stalePackets++
+								select {
+								case staleSent <- struct{}{}:
+								default:
+								}
+							}
+							originals[mapped] = value
+							return mapped, echo
+						}) {
+							rewriteFailures++
+						}
+						return true
+					},
+					mipstackToGVisor: func(packet []byte) bool {
+						tcpHeader, _, ok := tcpSegment(packet)
+						if !ok || !tcpHeader.ParsedOptions().TS {
+							return true
+						}
+						mu.Lock()
+						defer mu.Unlock()
+						if !rewriteTCPTimestamps(packet, func(value, echo uint32) (uint32, uint32) {
+							if original, ok := originals[echo]; ok {
+								echo = original
+							} else if echo != 0 {
+								rewriteFailures++
+							}
+							return value, echo
+						}) {
+							rewriteFailures++
+						}
+						return true
+					},
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				client, server, listener := openTCPPair(t, ctx, network, family, mipstackListens)
+				defer listener.Close()
+				defer client.Close()
+				defer server.Close()
+				mipstackConnection, gvisorConnection := client, server
+				if mipstackListens {
+					mipstackConnection, gvisorConnection = server, client
+				}
+				exchangeTCPPayload(t, gvisorConnection, mipstackConnection, []byte("before wrap"))
+				// Advancing gVisor's native millisecond clock by at least two ticks
+				// crosses zero in the translated clock without crossing its half-space.
+				time.Sleep(3 * time.Millisecond)
+				exchangeTCPPayload(t, gvisorConnection, mipstackConnection, []byte("after wrap"))
+				mu.Lock()
+				stale, rejectData = last-1_000_000, true
+				mu.Unlock()
+				payload := []byte("retransmitted after PAWS rejection")
+				_ = gvisorConnection.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				if n, err := gvisorConnection.Write(payload); err != nil || n != len(payload) {
+					t.Fatalf("gVisor write = %d, %v", n, err)
+				}
+				select {
+				case <-staleSent:
+				case <-ctx.Done():
+					t.Fatal("gVisor data did not reach the timestamp translator")
+				}
+				_ = mipstackConnection.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+				buffer := make([]byte, len(payload))
+				if n, err := mipstackConnection.Read(buffer); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+					t.Fatalf("stale gVisor data delivered %q, %v", buffer[:n], err)
+				}
+				mu.Lock()
+				rejectData = false
+				mu.Unlock()
+				_ = mipstackConnection.SetReadDeadline(time.Now().Add(5 * time.Second))
+				if _, err := io.ReadFull(mipstackConnection, buffer); err != nil || !bytes.Equal(buffer, payload) {
+					t.Fatalf("gVisor retransmission delivered %q, %v", buffer, err)
+				}
+				exerciseFullDuplexTCP(t, client, server, 32*1024)
+				mu.Lock()
+				defer mu.Unlock()
+				if wraps == 0 || stalePackets == 0 || rewriteFailures != 0 {
+					t.Fatalf("timestamp translation: wraps=%d, stale packets=%d, failures=%d", wraps, stalePackets, rewriteFailures)
+				}
+			})
+		}
+	}
+}
+
 // TestTCPSYNCookieOptionRecoveryInterop verifies that native gVisor
 // connections can complete through a mipstack SYN-cookie when a middlebox
 // removes Timestamp or clears TSecr in the final ACK. The first half-open
@@ -339,7 +473,9 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 		wantReceiveScale bool
 	}{
 		{name: "missing-timestamp", rewrite: stripTCPTimestamp},
-		{name: "zero-tsecr", rewrite: func(packet []byte) bool { return rewriteTCPTimestampEcho(packet, 0) }, wantTimestamp: true, wantWindowScale: true, wantReceiveScale: true},
+		{name: "zero-tsecr", rewrite: func(packet []byte) bool {
+			return rewriteTCPTimestamps(packet, func(value, _ uint32) (uint32, uint32) { return value, 0 })
+		}, wantTimestamp: true, wantWindowScale: true, wantReceiveScale: true},
 	}
 	for scenarioIndex, scenario := range scenarios {
 		scenarioIndex, scenario := scenarioIndex, scenario
@@ -473,7 +609,7 @@ func TestTCPActiveInvalidTimestampEchoInterop(t *testing.T) {
 					if !ok || !tcpHeader.Flags().Contains(header.TCPFlagSyn) || !tcpHeader.Flags().Contains(header.TCPFlagAck) {
 						return true
 					}
-					if rewriteTCPTimestampEcho(packet, 1<<30) {
+					if rewriteTCPTimestamps(packet, func(value, _ uint32) (uint32, uint32) { return value, 1 << 30 }) {
 						rewritten.Store(true)
 					}
 					return true
@@ -521,7 +657,7 @@ func TestTCPPassiveInvalidTimestampEchoInterop(t *testing.T) {
 						!tcpHeader.Flags().Contains(header.TCPFlagAck) {
 						return true
 					}
-					if rewriteTCPTimestampEcho(packet, 1<<30) {
+					if rewriteTCPTimestamps(packet, func(value, _ uint32) (uint32, uint32) { return value, 1 << 30 }) {
 						rewritten.Add(1)
 					}
 					return true
@@ -2626,10 +2762,10 @@ func stripTCPTimestamp(packet []byte) bool {
 	return true
 }
 
-// rewriteTCPTimestampEcho replaces one valid TCP Timestamp echo in a complete
-// IP packet through gVisor's wire headers. It models a middlebox changing
-// TSecr without making the impairment depend on mipstack's codecs.
-func rewriteTCPTimestampEcho(packet []byte, echo uint32) bool {
+// rewriteTCPTimestamps rewrites one valid TCP Timestamp option in a complete
+// IP packet through gVisor's wire headers. It models clock translation or
+// echo corruption without making the impairment depend on mipstack's codecs.
+func rewriteTCPTimestamps(packet []byte, rewrite func(value, echo uint32) (uint32, uint32)) bool {
 	if len(packet) == 0 {
 		return false
 	}
@@ -2687,13 +2823,17 @@ func rewriteTCPTimestampEcho(packet []byte, echo uint32) bool {
 		}
 		length := int(options[1])
 		if kind == header.TCPOptionTS && length == header.TCPOptionTSLength {
+			oldValue := binary.BigEndian.Uint32(options[2:6])
 			oldEcho := binary.BigEndian.Uint32(options[6:10])
 			oldChecksum := tcpHeader.Checksum()
+			value, echo := rewrite(oldValue, oldEcho)
+			binary.BigEndian.PutUint32(options[2:6], value)
 			binary.BigEndian.PutUint32(options[6:10], echo)
 			tcpHeader.SetChecksum(0)
 			partial := header.PseudoHeaderChecksum(header.TCPProtocolNumber, source, target, uint16(wireEnd-transportOffset))
 			tcpHeader.SetChecksum(^checksum.Checksum(tcpHeader, partial))
 			if checksum.Checksum(tcpHeader, partial) != 0xffff {
+				binary.BigEndian.PutUint32(options[2:6], oldValue)
 				binary.BigEndian.PutUint32(options[6:10], oldEcho)
 				tcpHeader.SetChecksum(oldChecksum)
 				return false

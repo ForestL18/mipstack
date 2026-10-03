@@ -2305,7 +2305,11 @@ func TestTCPTimeWaitSYNAdmission(t *testing.T) {
 		{name: "new timestamp", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now, sequence: 499, options: tcpTimestampOptions(101, 0), replace: true},
 		{name: "equal timestamp and new sequence", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now, sequence: 501, options: tcpTimestampOptions(100, 0), replace: true},
 		{name: "older timestamp rejected by paws", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now, sequence: 501, options: tcpTimestampOptions(99, 0)},
-		{name: "expired paws and new sequence", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now.Add(-tcpPAWSMaxAge - time.Hour), sequence: 501, options: tcpTimestampOptions(99, 0), replace: true},
+		{name: "before paws expiry", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now.Add(-2147*time.Second + time.Nanosecond), sequence: 501, options: tcpTimestampOptions(99, 0)},
+		{name: "exact paws expiry and new sequence", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now.Add(-2147 * time.Second), sequence: 501, options: tcpTimestampOptions(99, 0), replace: true},
+		{name: "expired paws and old sequence", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now.Add(-40 * time.Minute), sequence: 499, options: tcpTimestampOptions(99, 0)},
+		{name: "microsecond clock and new sequence", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now.Add(-40 * time.Minute), sequence: 501, options: tcpTimestampOptions(2_400_000_100, 0), replace: true},
+		{name: "microsecond clock and old sequence", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now.Add(-40 * time.Minute), sequence: 499, options: tcpTimestampOptions(2_400_000_100, 0)},
 		{name: "new sequence without timestamp", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now, sequence: 501, replace: true},
 		{name: "old sequence without timestamp", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now, sequence: 499},
 		{name: "timestamp enables new incarnation", peerTimestamp: false, sequence: 499, options: tcpTimestampOptions(101, 0), replace: true},
@@ -2321,7 +2325,6 @@ func TestTCPTimeWaitSYNAdmission(t *testing.T) {
 			state := &tcpEstablishedState{connection: connection, receiveNext: 500, lastTimestampUpdate: test.lastTimestampUpdate}
 			segment := tcpSegment{sequence: test.sequence, flags: TCPFlagSYN, optionLength: uint8(len(test.options))}
 			copy(segment.options[:], test.options)
-			now := time.Now()
 			got := state.handleTimeWaitSegment(segment, now, now)
 			if got != test.replace {
 				t.Fatalf("TIME-WAIT SYN replacement = %v, want %v", got, test.replace)
@@ -2358,6 +2361,54 @@ func TestTCPTimeWaitDoesNotLearnTimestampFromOutOfWindow(t *testing.T) {
 	state.handleTimeWaitSegment(inWindow, now, now)
 	if connection.recentTimestamp != 200 {
 		t.Fatalf("in-window TS.Recent = %d, want 200", connection.recentTimestamp)
+	}
+}
+
+// TestTCPTimeWaitPAWSExpiry verifies that an expired reference permits a
+// microsecond-clock peer to refresh TS.Recent only through an exact pure ACK.
+// The refreshed reference must immediately protect the tuple again.
+func TestTCPTimeWaitPAWSExpiry(t *testing.T) {
+	now := time.Now()
+	connection := &TCPConn{stack: &Stack{}, peerTimestamp: true, recentTimestamp: 100}
+	state := &tcpEstablishedState{
+		connection:          connection,
+		receiveNext:         500,
+		lastACKSent:         500,
+		lastTimestampUpdate: now,
+		receiveWindowState:  newTCPReceiveWindow(500, 4096, false, false, 0),
+	}
+	for _, step := range []struct {
+		name     string
+		sequence uint32
+		flags    byte
+		tsval    uint32
+		age      time.Duration
+		want     uint32
+	}{
+		{name: "fresh reference rejects stale ACK", sequence: 500, flags: TCPFlagACK, tsval: 99, age: 2147*time.Second - time.Nanosecond, want: 100},
+		{name: "expiry does not bypass sequence gate", sequence: 499, flags: TCPFlagACK, tsval: 2_400_000_100, age: 40 * time.Minute, want: 100},
+		{name: "expiry does not bypass control gate", sequence: 500, flags: TCPFlagACK | TCPFlagFIN, tsval: 2_400_000_100, age: 40 * time.Minute, want: 100},
+		{name: "exact ACK refreshes expired reference", sequence: 500, flags: TCPFlagACK, tsval: 2_400_000_100, age: 40 * time.Minute, want: 2_400_000_100},
+		{name: "refreshed reference rejects old ACK", sequence: 500, flags: TCPFlagACK, tsval: 2_400_000_098, age: 40*time.Minute + time.Second, want: 2_400_000_100},
+		{name: "new ACK remains accepted", sequence: 500, flags: TCPFlagACK, tsval: 2_400_000_101, age: 40*time.Minute + 2*time.Second, want: 2_400_000_101},
+	} {
+		previousTimestamp, previousUpdate := connection.recentTimestamp, state.lastTimestampUpdate
+		segment := tcpSegment{sequence: step.sequence, flags: step.flags}
+		segment.setOptions(tcpTimestampOptions(step.tsval, 0))
+		receivedAt := now.Add(step.age)
+		if state.handleTimeWaitSegment(segment, receivedAt, receivedAt) {
+			t.Fatalf("%s: TIME-WAIT ACK unexpectedly replaced the tuple", step.name)
+		}
+		if got := connection.recentTimestamp; got != step.want {
+			t.Fatalf("%s: TS.Recent = %d, want %d", step.name, got, step.want)
+		}
+		wantUpdate := previousUpdate
+		if step.want != previousTimestamp {
+			wantUpdate = receivedAt
+		}
+		if !state.lastTimestampUpdate.Equal(wantUpdate) {
+			t.Fatalf("%s: reference update time = %v, want %v", step.name, state.lastTimestampUpdate, wantUpdate)
+		}
 	}
 }
 
@@ -5869,7 +5920,7 @@ func TestTCPKeepAliveCapacityRetryHonorsUserTimeout(t *testing.T) {
 			last := len(held) - 1
 			stack.outbound.releaseReserved(held[last])
 			held = held[:last]
-			if !test.concurrentOutput {
+			if !test.applicationOutput && !test.closeWrite {
 				waitFor(t, time.Second, func() bool { return len(stack.outbound.free) == 0 })
 			}
 			if test.expired {
@@ -11623,9 +11674,12 @@ func TestTCPPAWSLinuxRules(t *testing.T) {
 		{name: "one tick replay", tsval: 99, recent: 100, window: 1},
 		{name: "older than replay", tsval: 98, recent: 100, window: 1, reject: true},
 		{name: "zero recent", tsval: 1, recent: 0, window: 0},
-		{name: "fresh lifetime boundary", tsval: 1, recent: 100, age: tcpPAWSMaxAge - time.Nanosecond, reject: true},
-		{name: "exact lifetime boundary", tsval: 1, recent: 100, age: tcpPAWSMaxAge},
-		{name: "expired recent", tsval: 1, recent: 100, age: tcpPAWSMaxAge + time.Second},
+		{name: "fresh lifetime boundary", tsval: 1, recent: 100, age: 2147*time.Second - time.Nanosecond, reject: true},
+		{name: "exact lifetime boundary", tsval: 1, recent: 100, age: 2147 * time.Second},
+		{name: "expired recent", tsval: 1, recent: 100, age: 2148 * time.Second},
+		{name: "microsecond clock before expiry", tsval: 2_400_000_100, recent: 100, age: 2146 * time.Second, reject: true},
+		{name: "microsecond clock after idle", tsval: 2_400_000_100, recent: 100, age: 40 * time.Minute},
+		{name: "millisecond clock after idle", tsval: 2_400_100, recent: 100, age: 40 * time.Minute},
 		{name: "serial wrap", tsval: 1, recent: ^uint32(0), window: 0},
 		{name: "serial wrap older", tsval: ^uint32(0), recent: 1, window: 0, reject: true},
 	} {
@@ -11633,6 +11687,141 @@ func TestTCPPAWSLinuxRules(t *testing.T) {
 			if got := tcpPAWSReject(test.tsval, test.recent, now.Add(-test.age), now, test.window); got != test.reject {
 				t.Fatalf("PAWS reject = %v, want %v", got, test.reject)
 			}
+		})
+	}
+}
+
+// TestTCPPAWSHighFrequencyRecovery uses the production TCP input and actor
+// with explicit arrival times to cover long-idle recovery without a wall-clock
+// wait. Wire ACKs and application reads prove both reference refresh and the
+// renewed rejection of stale data; invalid segments cannot refresh it.
+func TestTCPPAWSHighFrequencyRecovery(t *testing.T) {
+	for _, ipv6 := range []bool{false, true} {
+		name := "ipv4"
+		local, remote := netip.MustParseAddr("192.0.2.5"), netip.MustParseAddr("192.0.2.6")
+		if ipv6 {
+			name = "ipv6"
+			local, remote = netip.MustParseAddr("2001:db8::5"), netip.MustParseAddr("2001:db8::6")
+		}
+		t.Run(name, func(t *testing.T) {
+			link, stack := newTestStack(t, local, remote)
+			link.mu.Lock()
+			link.echoTCP, link.timestampTCP = true, true
+			link.mu.Unlock()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			connection, err := stack.DialTCP(ctx, "tcp", netip.AddrPort{}, netip.AddrPortFrom(remote, 9112))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			c := connection.(*TCPConn)
+			link.mu.Lock()
+			link.echoTCP = false
+			peer := link.tcp[c.key.local.Port()]
+			sequence, acknowledgement, seedTimestamp := peer.serverNext, peer.clientNext, peer.timestamp+100
+			link.mu.Unlock()
+			start := time.Now().Add(time.Second)
+			inject := func(seq, ack, tsval uint32, at time.Time, payload string) {
+				t.Helper()
+				wire := buildTestTCP(remote, local, c.key.remote.Port(), c.key.local.Port(), seq, ack, TCPFlagACK|TCPFlagPSH, 65535, tcpTimestampOptions(tsval, 0), []byte(payload))
+				packet, ok := parseIPPacket(wire, false)
+				if !ok {
+					t.Fatal("invalid fixture IP packet")
+				}
+				if err := stack.handleTCP(packet, at, true, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			read := func(want string) {
+				t.Helper()
+				_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+				buffer := make([]byte, len(want))
+				if _, err := io.ReadFull(connection, buffer); err != nil || string(buffer) != want {
+					t.Fatalf("received %q, %v; want %q", buffer, err, want)
+				}
+			}
+			assertACK := func(wantAck, wantEcho uint32) {
+				t.Helper()
+				deadline := time.NewTimer(time.Second)
+				defer deadline.Stop()
+				for {
+					select {
+					case wire := <-link.outbound:
+						packet, ok := parseIPPacket(wire, false)
+						if !ok || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize || binary.BigEndian.Uint32(packet.payload[8:12]) != wantAck {
+							continue
+						}
+						headerSize := int(packet.payload[12]>>4) * 4
+						_, echo, present := parseTCPTimestamp(packet.payload[tcpHeaderSize:headerSize])
+						if !present || echo != wantEcho {
+							t.Fatalf("ACK timestamp echo = %d, present:%v; want %d", echo, present, wantEcho)
+						}
+						return
+					case <-deadline.C:
+						t.Fatalf("no ACK for sequence %d", wantAck)
+					}
+				}
+			}
+			assertRejected := func() {
+				t.Helper()
+				_ = connection.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+				var buffer [16]byte
+				if n, err := connection.Read(buffer[:]); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+					t.Fatalf("rejected segment delivered %q, %v", buffer[:n], err)
+				}
+			}
+			inject(sequence, acknowledgement, seedTimestamp, start, "seed")
+			read("seed")
+			sequence += 4
+			assertACK(sequence, seedTimestamp)
+			inject(sequence, acknowledgement, seedTimestamp-2, start.Add(2147*time.Second-time.Nanosecond), "stale")
+			assertRejected()
+			// A 1 MHz clock advances 2.4 billion ticks in 40 minutes, crossing
+			// the serial-number half-space without necessarily wrapping to zero.
+			recoveredTimestamp := seedTimestamp + 2_400_000_000
+			recoveredAt := start.Add(40 * time.Minute)
+			inject(sequence, acknowledgement+1, recoveredTimestamp+100, recoveredAt, "bad ACK")
+			inject(sequence+1<<30, acknowledgement, recoveredTimestamp+100, recoveredAt, "bad sequence")
+			assertRejected()
+			inject(sequence, acknowledgement, recoveredTimestamp, recoveredAt, "recovered")
+			read("recovered")
+			sequence += uint32(len("recovered"))
+			assertACK(sequence, recoveredTimestamp)
+			inject(sequence, acknowledgement, recoveredTimestamp-2, recoveredAt.Add(time.Second), "replay")
+			assertRejected()
+			inject(sequence, acknowledgement, recoveredTimestamp+1, recoveredAt.Add(2*time.Second), "fresh")
+			read("fresh")
+			sequence += uint32(len("fresh"))
+			assertACK(sequence, recoveredTimestamp+1)
+		})
+	}
+}
+
+func BenchmarkTCPPAWS(b *testing.B) {
+	now := time.Now()
+	for _, test := range []struct {
+		name  string
+		tsval uint32
+		age   time.Duration
+	}{
+		{name: "increasing", tsval: 101},
+		{name: "equal", tsval: 100},
+		{name: "stale", tsval: 98, age: time.Second},
+		{name: "expired", tsval: 2_400_000_100, age: 40 * time.Minute},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			recentAt := now.Add(-test.age)
+			rejections := 0
+			b.ReportAllocs()
+			b.ResetTimer()
+			for index := 0; index < b.N; index++ {
+				if tcpPAWSReject(test.tsval, 100, recentAt, now, tcpPAWSReplayWindow) {
+					rejections++
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(rejections)/float64(b.N), "reject/op")
 		})
 	}
 }
