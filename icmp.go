@@ -1158,6 +1158,16 @@ func (s *Stack) handleMulticastICMPv6(packet ipPacket) error {
 // forwarded socket. It reports whether a transport or raw endpoint accepted
 // the error.
 func (s *Stack) deliverICMPError(remoteError ICMPError) bool {
+	// Linux icmp_unreach ignores IPv4 reassembly-timeout errors before socket
+	// delivery: a lost fragment does not establish host unreachability and
+	// must not interrupt later reads or writes. This follows Linux's narrower
+	// reporting policy, rather than RFC 1122 section 3.2.2.4's requirement to
+	// pass all Time Exceeded messages to the transport layer. Raw ICMP input
+	// and the unhandled-message forwarder remain separate from socket errors.
+	if remoteError.Type == ICMPv4TypeTimeExceeded &&
+		remoteError.Code == ICMPv4TimeExceededCodeFragmentReassembly && remoteError.Reporter.Is4() {
+		return false
+	}
 	accepted := false
 	switch remoteError.QuotedProtocol {
 	case ProtocolUDP:

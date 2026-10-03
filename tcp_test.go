@@ -10037,6 +10037,64 @@ func TestTCPNetworkErrorQueueIsLazyBoundedAndOrdered(t *testing.T) {
 	}
 }
 
+// TestTCPIPv4ReassemblyTimeoutDoesNotQueueError exercises device input before
+// actor consumption, so rejection cannot be confused with a drained event.
+func TestTCPIPv4ReassemblyTimeoutDoesNotQueueError(t *testing.T) {
+	local, remote := netip.MustParseAddr("192.0.2.196"), netip.MustParseAddr("198.51.100.196")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	key := tcpKey{local: netip.AddrPortFrom(local, 40196), remote: netip.AddrPortFrom(remote, 40197)}
+	connection := newTCPConn(stack, "tcp4", key, 1500, tcpSocketOptionSet{})
+	connection.publishICMPSequenceRange(100, 120)
+	stack.mu.Lock()
+	stack.tcp[key] = connection
+	stack.mu.Unlock()
+	defer func() {
+		stack.mu.Lock()
+		delete(stack.tcp, key)
+		stack.mu.Unlock()
+	}()
+	segment := mustTestWire((TCPSegment{Source: key.local, Destination: key.remote, SequenceNumber: 100, Flags: TCPFlagACK}).MarshalBinary())
+	quote := mustTestWire((IPPacket{Source: local, Destination: remote, Protocol: ProtocolTCP, HopLimit: 64, Payload: segment}).MarshalBinary())
+	inject := func(code uint8) {
+		t.Helper()
+		message, err := (ICMPError{Reporter: remote, Type: ICMPv4TypeTimeExceeded, Code: code, QuotedPacket: quote}).ICMPMessage(local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire := mustTestWire((IPPacket{Source: remote, Destination: local, Protocol: ProtocolICMPv4, HopLimit: 64, Payload: mustTestWire(message.MarshalBinary())}).MarshalBinary())
+		if err = writeTestPacket(stack, wire); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inject(ICMPv4TimeExceededCodeFragmentReassembly)
+	connection.mu.Lock()
+	allocated := connection.pending != nil
+	connection.mu.Unlock()
+	if allocated || connection.takeActorWake() != 0 {
+		t.Fatal("reassembly timeout allocated TCP error state or woke its actor")
+	}
+	inject(ICMPv4TimeExceededCodeTTLInTransit)
+	inject(ICMPv4TimeExceededCodeFragmentReassembly)
+	queued, ok := connection.takeNetworkError()
+	var networkError ICMPError
+	if !ok || !errors.As(queued, &networkError) || networkError.Code != ICMPv4TimeExceededCodeTTLInTransit || !bytes.Equal(networkError.QuotedPacket, quote) {
+		t.Fatalf("correlated TCP TTL error = %v, %t", queued, ok)
+	}
+	if queued, ok = connection.takeNetworkError(); ok || queued != nil {
+		t.Fatalf("reassembly timeout appended another TCP error: %v, %t", queued, ok)
+	}
+	if connection.takeActorWake() != tcpActorWakeNetworkError {
+		t.Fatal("reportable TCP error did not wake its actor")
+	}
+}
+
 func TestTCPReadNotificationIsLazyAndCannotMissWake(t *testing.T) {
 	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	if connection.readNotify != nil {

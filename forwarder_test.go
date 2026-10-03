@@ -5482,6 +5482,75 @@ func TestICMPForwarderRepliesOnlyResponder(t *testing.T) {
 	}
 }
 
+// TestUDPForwardedIPv4ReassemblyTimeout verifies the exception for a socket
+// bound to an intercepted, nonlocal address rather than an owned local one.
+func TestUDPForwardedIPv4ReassemblyTimeout(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.197")
+	remote, intercepted := netip.MustParseAddr("198.51.100.197"), netip.MustParseAddr("203.0.113.197")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, Promiscuous: true, MTU: 1280})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var connection *UDPConn
+	var acceptErr error
+	forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+		connection, acceptErr = request.Accept(SocketOptions.ReceiveErrors(true))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	payload := mustTestWire((UDPDatagram{Source: netip.AddrPortFrom(remote, 40197), Destination: netip.AddrPortFrom(intercepted, 5353), Payload: []byte("request")}).MarshalBinary())
+	if err = writeTestPacket(stack, mustTestWire((IPPacket{Source: remote, Destination: intercepted, Protocol: ProtocolUDP, HopLimit: 64, Payload: payload}).MarshalBinary())); err != nil {
+		t.Fatal(err)
+	}
+	if acceptErr != nil || connection == nil {
+		t.Fatalf("forwarded socket = %v, %v", connection, acceptErr)
+	}
+	defer connection.Close()
+	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err = connection.Write([]byte("reply")); err != nil {
+		t.Fatal(err)
+	}
+	quote := readOutboundPacket(t, stack)
+	for index, code := range []uint8{ICMPv4TimeExceededCodeFragmentReassembly, ICMPv4TimeExceededCodeTTLInTransit, ICMPv4TimeExceededCodeFragmentReassembly} {
+		message, err := (ICMPError{Reporter: remote, Type: ICMPv4TypeTimeExceeded, Code: code, QuotedPacket: quote}).ICMPMessage(intercepted)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = writeTestPacket(stack, mustTestWire((IPPacket{Source: remote, Destination: intercepted, Protocol: ProtocolICMPv4, HopLimit: 64, Payload: mustTestWire(message.MarshalBinary())}).MarshalBinary())); err != nil {
+			t.Fatal(err)
+		}
+		if index == 0 {
+			if info := connection.Info(); info.ICMPErrors != 0 || info.ErrorQueueEntries != 0 || info.LastError != nil {
+				t.Fatalf("forwarded socket retained a reassembly timeout: %+v", info)
+			}
+			if n, err := connection.Write([]byte("still writable")); err != nil || n != len("still writable") {
+				t.Fatalf("forwarded write after reassembly timeout = %d, %v", n, err)
+			}
+			_ = readOutboundPacket(t, stack)
+		}
+	}
+	if info := connection.Info(); info.ICMPErrors != 1 || info.ErrorQueueEntries != 1 {
+		t.Fatalf("forwarded socket retained something other than the TTL error: %+v", info)
+	}
+	buffer := make([]byte, 64)
+	var networkError ICMPError
+	if n, readErr := connection.Read(buffer); n != 0 || !errors.As(readErr, &networkError) || networkError.Code != ICMPv4TimeExceededCodeTTLInTransit {
+		t.Fatalf("forwarded pending error = %d, %v", n, readErr)
+	}
+	if queued, queueErr := connection.ReadError(); queueErr != nil || !errors.As(queued, &networkError) || networkError.Code != ICMPv4TimeExceededCodeTTLInTransit {
+		t.Fatalf("forwarded extended error = %v, %v", queued, queueErr)
+	}
+	if n, readErr := connection.Read(buffer); readErr != nil || !bytes.Equal(buffer[:n], []byte("request")) {
+		t.Fatalf("forwarded queued data = %d, %v", n, readErr)
+	}
+}
+
 func BenchmarkUDPForwarderReply(b *testing.B) {
 	local := netip.MustParseAddr("192.0.2.200")
 	remote := netip.MustParseAddr("192.0.2.201")

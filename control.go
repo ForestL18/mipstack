@@ -581,7 +581,8 @@ func linuxICMPErrno(networkError ICMPError) uint32 {
 	return linuxICMPErrorConversion(networkError).linuxErrno
 }
 
-// linuxDatagramICMPReport applies Linux UDP/raw IPv4 and IPv6 error policy.
+// linuxDatagramICMPReport applies Linux UDP/raw IPv4 and IPv6 reporting policy
+// to errors admitted by the common ICMP socket-delivery path.
 // The hard-error classification comes from Linux's ICMP conversion tables;
 // the PMTU mode exceptions mirror Linux udp_err, raw_err, udp6_err, and
 // rawv6_err rather than changing RFC PMTU processing.
