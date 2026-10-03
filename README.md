@@ -1011,8 +1011,9 @@ response bounds the restored congestion window and makes the RTO more
 conservative after a spurious timeout is detected. Reno and CUBIC also apply
 Linux-style RFC 2861 idle and application-limited congestion-window validation;
 model-based controllers retain their own window policy. TCP also handles
-overlap-aware receive reassembly, data-bearing zero-window probes, reset
-validation, deadlines, half-close, FIN states, and TIME_WAIT.
+overlap-aware receive reassembly, data-bearing zero-window probes, RFC 5961
+reset validation with Linux-compatible consumed-FIN and receive-SACK boundary
+handling, deadlines, half-close, FIN states, and TIME_WAIT.
 
 BBR is a byte-scaled implementation of Linux BBRv1. Each original or
 retransmitted range carries a Linux-style delivery snapshot; ACK processing

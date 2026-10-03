@@ -1475,6 +1475,182 @@ func TestTCPEstablishedResetInterop(t *testing.T) {
 	}
 }
 
+// TestTCPReceiveBoundaryResetInterop observes application-visible termination
+// after a native gVisor abort. The FIN case changes only the reset sequence to
+// model peers that reuse their FIN sequence; the receive-hole case delivers
+// gVisor's reset unchanged after verifying mipstack's real SACK feedback.
+func TestTCPReceiveBoundaryResetInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, scenario := range []string{"consumed-FIN", "receive-SACK"} {
+			scenario := scenario
+			t.Run(family.name+"/"+scenario, func(t *testing.T) {
+				firstData := make(chan uint32, 1)
+				sackEnds := make(chan uint32, 32)
+				resets := make(chan uint32, 1)
+				var firstSequence, finSequence uint32
+				var haveData, haveFIN, resetDelivered bool
+				network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+					families: []interopFamily{family}, mtu: 1500,
+					gvisorToMipstack: func(packet []byte) bool {
+						segment, payloadLength, ok := tcpSegment(packet)
+						if !ok {
+							return true
+						}
+						if segment.Flags()&header.TCPFlagFin != 0 {
+							finSequence = segment.SequenceNumber() + uint32(payloadLength)
+							haveFIN = true
+						}
+						if segment.Flags()&header.TCPFlagRst != 0 {
+							// Suppress later stateless resets: termination must
+							// follow the native abort, not a challenge-ACK round trip.
+							if resetDelivered {
+								return false
+							}
+							resetDelivered = true
+							if scenario == "consumed-FIN" && haveFIN {
+								segment.SetSequenceNumber(finSequence)
+								segment.SetChecksum(0)
+								partial := header.PseudoHeaderChecksum(header.TCPProtocolNumber, gvisorAddress(family.gvisorAddress), gvisorAddress(family.mipstackAddress), uint16(len(segment)))
+								segment.SetChecksum(^checksum.Checksum(segment, partial))
+							}
+							select {
+							case resets <- segment.SequenceNumber():
+							default:
+							}
+						}
+						if scenario == "receive-SACK" && payloadLength != 0 {
+							if !haveData {
+								firstSequence, haveData = segment.SequenceNumber(), true
+								firstData <- firstSequence
+							}
+							// Keep the initial hole open through retransmission so
+							// the abort cannot accidentally become an exact RCV.NXT reset.
+							return segment.SequenceNumber() != firstSequence
+						}
+						return true
+					},
+					mipstackToGVisor: func(packet []byte) bool {
+						segment, _, ok := tcpSegment(packet)
+						if ok {
+							for _, block := range header.ParseTCPOptions(segment.Options()).SACKBlocks {
+								select {
+								case sackEnds <- uint32(block.End):
+								default:
+								}
+							}
+						}
+						return true
+					},
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				const port = 44982
+				var queue waiter.Queue
+				listener, tcpipErr := network.gvisor.NewEndpoint(tcp.ProtocolNumber, family.networkProtocol, &queue)
+				if tcpipErr != nil {
+					t.Fatal(tcpipErr.String())
+				}
+				defer listener.Close()
+				if tcpipErr = listener.Bind(gvisorFullAddress(family.gvisorAddress, port)); tcpipErr != nil {
+					t.Fatal(tcpipErr.String())
+				}
+				// A backlog of one triggers gVisor's SYN-cookie path, which
+				// does not retain SACK negotiation for this receive-hole test.
+				if tcpipErr = listener.Listen(16); tcpipErr != nil {
+					t.Fatal(tcpipErr.String())
+				}
+				entry, notifications := registerReadable(&queue)
+				defer queue.EventUnregister(&entry)
+				type dialResult struct {
+					connection net.Conn
+					err        error
+				}
+				dialed := make(chan dialResult, 1)
+				go func() {
+					connection, err := network.mipstack.DialTCP(ctx, family.tcpNetwork, netip.AddrPort{}, netipAddrPort(family.gvisorAddress, port))
+					dialed <- dialResult{connection, err}
+				}()
+				accepted, acceptedQueue, err := acceptGVisorTCP(ctx, listener, notifications)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer accepted.Close()
+				result := <-dialed
+				if result.err != nil {
+					t.Fatal(result.err)
+				}
+				connection := result.connection.(*mipstack.TCPConn)
+				defer connection.Close()
+				_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+				var resetSequence uint32
+				if scenario == "consumed-FIN" {
+					if tcpipErr = accepted.Shutdown(tcpip.ShutdownWrite); tcpipErr != nil {
+						t.Fatal(tcpipErr.String())
+					}
+					if n, err := connection.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+						t.Fatalf("Read after native FIN = %d, %v, want EOF", n, err)
+					}
+					if info := connection.Info(); info.State != mipstack.TCPStateCloseWait {
+						t.Fatalf("state after peer FIN = %s, want CLOSE-WAIT", info.State)
+					}
+				} else {
+					accepted.SocketOptions().SetDelayOption(false)
+					peer := gonet.NewTCPConn(acceptedQueue, accepted)
+					_ = peer.SetWriteDeadline(time.Now().Add(3 * time.Second))
+					payload := patternedPayload(6000, 137)
+					if n, err := peer.Write(payload); n != len(payload) || err != nil {
+						t.Fatalf("native data Write = %d, %v", n, err)
+					}
+					select {
+					case sequence := <-firstData:
+						resetSequence = sequence + uint32(len(payload))
+					case <-ctx.Done():
+						t.Fatal("gVisor emitted no data")
+					}
+					observed := false
+					var observedEnds []uint32
+					for !observed {
+						select {
+						case end := <-sackEnds:
+							observedEnds = append(observedEnds, end)
+							observed = end == resetSequence
+						case <-ctx.Done():
+							t.Fatalf("mipstack did not SACK end %d: observed %v, info %+v", resetSequence, observedEnds, connection.Info())
+						}
+					}
+				}
+				accepted.SocketOptions().SetLinger(tcpip.LingerOption{Enabled: true})
+				accepted.Close()
+				if scenario == "receive-SACK" {
+					if n, err := connection.Read(make([]byte, 1)); n != 0 || !errors.Is(err, syscall.ECONNRESET) {
+						t.Fatalf("Read after native SACK-edge abort = %d, %v, want ECONNRESET", n, err)
+					}
+				}
+				deadline := time.Now().Add(time.Second)
+				for {
+					info := connection.Info()
+					if info.State == mipstack.TCPStateClosed && errors.Is(info.LastError, syscall.ECONNRESET) {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("state after peer abort = %+v, want ECONNRESET", info)
+					}
+					time.Sleep(time.Millisecond)
+				}
+				select {
+				case sequence := <-resets:
+					if scenario == "receive-SACK" && sequence != resetSequence {
+						t.Fatalf("native RST sequence = %d, want SACK end %d", sequence, resetSequence)
+					}
+				case <-ctx.Done():
+					t.Fatal("native abort emitted no reset")
+				}
+			})
+		}
+	}
+}
+
 // TestTCPImpairedLinkInterop verifies bidirectional recovery when the bridge
 // drops or reorders the first TCP data packets emitted by both stacks.
 func TestTCPImpairedLinkInterop(t *testing.T) {

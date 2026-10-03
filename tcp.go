@@ -2271,6 +2271,38 @@ func (s *tcpEstablishedState) connectionState() TCPState {
 	}
 }
 
+// acceptsResetException implements Linux's consumed-FIN and receive-SACK
+// extensions to RFC 5961 section 3.2. The ordinary exact RCV.NXT match remains
+// subject to the RFC 9293 receive-window test at the call site.
+func (s *tcpEstablishedState) acceptsResetException(sequence, receiveWindow uint32) bool {
+	if sequence == s.receiveNext {
+		return false
+	}
+	if s.remoteFINReceived && sequence == s.receiveNext-1 {
+		// FIN consumes one sequence number (RFC 9293 section 3.4). Linux's
+		// tcp_reset_check also accepts that FIN's sequence in these states:
+		// some peers abort with FIN followed by RST at the same sequence.
+		switch s.connectionState() {
+		case TCPStateCloseWait, TCPStateLastACK, TCPStateClosing:
+			return true
+		}
+	}
+	if !s.peerSACK || len(s.outOfOrder) == 0 || sequence-s.receiveNext > receiveWindow {
+		return false
+	}
+	// Linux's tcp_validate_incoming accepts the furthest receive SACK end,
+	// since a resetting sender may use SND.NXT beyond the receive hole.
+	// normalizeTCPReceivedPieces sorts retained ranges and truncates at FIN,
+	// so the tail supplies this boundary without scanning or caching it. It
+	// must remain within the advertised window, including its right edge.
+	last := &s.outOfOrder[len(s.outOfOrder)-1]
+	right := last.sequence + uint32(len(last.payload))
+	if last.fin {
+		right++
+	}
+	return sequence == right
+}
+
 // tcpTimeWaitReplacer is populated when a listener or TCP forwarder is
 // installed. The established actor can therefore keep its cold replacement
 // hook without making optional passive-dispatch code reachable in dial-only
@@ -8888,7 +8920,11 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					}
 				}
 				if !tcpSegmentAcceptable(segment.sequence, payloadLength, state.receiveNext, receiveWindow) {
-					if segment.flags&TCPFlagRST == 0 {
+					if segment.flags&TCPFlagRST != 0 {
+						if state.acceptsResetException(segment.sequence, receiveWindow) {
+							return syscall.ECONNRESET
+						}
+					} else {
 						if tcpKeepAliveOrWindowProbe(segment, payloadLength, state.receiveNext, receiveWindow) {
 							state.trySendACK()
 						} else {
@@ -8911,7 +8947,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					}
 				}
 				if segment.flags&TCPFlagRST != 0 {
-					if segment.sequence == state.receiveNext {
+					if segment.sequence == state.receiveNext || state.acceptsResetException(segment.sequence, receiveWindow) {
 						return syscall.ECONNRESET
 					}
 					state.trySendChallengeACK()
