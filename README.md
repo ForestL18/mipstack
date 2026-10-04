@@ -1077,6 +1077,10 @@ TCP user timeout follows Linux `TCP_USER_TIMEOUT`: it applies only in
 synchronized states, returns `ETIMEDOUT`, does not change retransmission or
 keepalive probe timing, and bounds data that remains unacknowledged or unsent
 behind a zero window. Retransmission does not restart the absolute deadline.
+Consecutive unanswered zero-window probes have a bounded retry budget; current
+ACK responses keep an open connection alive even if the window remains closed.
+For an open connection, the final unanswered probe's response interval starts
+when its departure from the device-output queue is observed.
 When keepalive is enabled, user timeout replaces the probe-count close policy
 and is checked before a subsequent probe, after at least one probe has been
 sent and its interval has elapsed.
@@ -1087,10 +1091,11 @@ When the SYN backlog or configured connection capacity is exhausted, passive
 open uses stateless SYN cookies instead of retaining another half-open
 connection. A per-stack random key authenticates the complete tuple, client
 sequence, recent time period, and negotiated options. A valid final ACK
-reconstructs the conservative MSS and authenticated negotiated options. If
-that ACK lacks Timestamp, the restored connection disables Timestamp, SACK,
-window scaling, and ECN. Forged or expired cookies do not allocate a
-connection.
+reconstructs the conservative MSS and authenticated negotiated options. If the
+SYN lacks Timestamp, the cookie SYN-ACK does not negotiate SACK or window
+scaling. If that ACK lacks Timestamp, the restored connection disables
+Timestamp, SACK, window scaling, and ECN. Forged or expired cookies do not
+allocate a connection.
 
 Validated ICMP Packet Too Big errors maintain a bounded, expiring destination
 PMTU cache. Error type/code combinations and quoted TCP sequence spans are

@@ -278,6 +278,147 @@ func TestTruncatedICMPv6ErrorIsRejected(t *testing.T) {
 	}
 }
 
+// TestICMPRecursiveSuppressionUsesInvokingFamily checks Stack.Write's
+// Parameter Problem and reassembly timeout responses, not just the classifier.
+func TestICMPRecursiveSuppressionUsesInvokingFamily(t *testing.T) {
+	for _, family := range []struct {
+		name, local, remote string
+		protocol            byte
+	}{
+		{"IPv4", "192.0.2.194", "198.51.100.194", ProtocolICMPv4},
+		{"IPv6", "2001:db8::194", "2001:db8:1::194", ProtocolICMPv6},
+	} {
+		for _, foreign := range []bool{false, true} {
+			for _, informational := range []bool{false, true} {
+				for _, fragment := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/foreign-%v/info-%v/fragment-%v", family.name, foreign, informational, fragment), func(t *testing.T) {
+						local, remote := netip.MustParseAddr(family.local), netip.MustParseAddr(family.remote)
+						stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())}})
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err = stack.Start(); err != nil {
+							t.Fatal(err)
+						}
+						defer stack.Close()
+						protocol := family.protocol
+						if foreign {
+							if protocol == ProtocolICMPv4 {
+								protocol = ProtocolICMPv6
+							} else {
+								protocol = ProtocolICMPv4
+							}
+						}
+						messageType := byte(ICMPv4TypeDestinationUnreachable)
+						if protocol == ProtocolICMPv6 {
+							messageType = ICMPv6TypeDestinationUnreachable
+						}
+						if informational {
+							if protocol == ProtocolICMPv4 {
+								messageType = ICMPv4TypeEchoRequest
+							} else {
+								messageType = ICMPv6TypeEchoRequest
+							}
+						}
+						payload := make([]byte, 8)
+						payload[0] = messageType
+						packet := IPPacket{Source: remote, Destination: local, Protocol: int(protocol), HopLimit: 64, Payload: payload}
+						if !fragment && local.Is4() {
+							packet.IPv4Options = []byte{0x44, 1, 0, 0}
+						} else if !fragment {
+							packet.Protocol = int(IPv6ExtensionHeaderDestination)
+							packet.Payload = append([]byte{protocol, 0, 0x80, 0, 0, 0, 0, 0}, payload...)
+						}
+						wire, err := packet.MarshalRawBinary()
+						if err != nil {
+							t.Fatal(err)
+						}
+						if fragment {
+							payload = append(payload, make([]byte, 2000)...)
+							if local.Is4() {
+								wire = buildIPv4Fragments(remote, local, protocol, payload, 1280, 1)[0]
+							} else {
+								wire = buildIPv6FragmentsWithOptions(remote, local, protocol, payload, 1280, 1, ipPacketOptions{})[0]
+							}
+						}
+						if err = writeTestPacket(stack, wire); err != nil {
+							t.Fatal(err)
+						}
+						if fragment {
+							stack.expireFragments(time.Now().Add(fragmentIPv6Lifetime + fragmentIPv4Lifetime + time.Second))
+						}
+						if !foreign && !informational {
+							if entry, ok := waitTestPacketEntry(&stack.outbound, 25*time.Millisecond); ok {
+								t.Fatalf("recursive response: %x", consumeTestPacket(&stack.outbound, entry))
+							}
+							return
+						}
+						response := readOutboundPacket(t, stack)
+						parsed, ok := parseIPPacket(response, false)
+						if !ok || parsed.protocol != family.protocol || parsed.source != local || parsed.target != remote || len(parsed.payload) < 8 {
+							t.Fatalf("invalid response: %x", response)
+						}
+						wantType, wantCode, wantPointer := byte(ICMPv4TypeParameterProblem), byte(0), uint32(20)
+						pointer := uint32(parsed.payload[4])
+						validChecksum := checksum(parsed.payload) == 0
+						if local.Is6() {
+							wantType, wantCode, wantPointer = ICMPv6TypeParameterProblem, 2, 42
+							pointer = binary.BigEndian.Uint32(parsed.payload[4:8])
+							validChecksum = transportChecksum(local, remote, ProtocolICMPv6, parsed.payload) == 0
+						}
+						if fragment {
+							wantType, wantCode, wantPointer = ICMPv4TypeTimeExceeded, 1, 0
+							if local.Is6() {
+								wantType = ICMPv6TypeTimeExceeded
+							}
+						}
+						quoteSize := int(wire[0]&0x0f)*4 + 8
+						if local.Is6() {
+							quoteSize = len(wire)
+							if quoteSize > 1280-40-8 {
+								quoteSize = 1280 - 40 - 8
+							}
+						}
+						if parsed.payload[0] != wantType || parsed.payload[1] != wantCode || pointer != wantPointer || !validChecksum || !bytes.Equal(wire[:quoteSize], parsed.payload[8:]) {
+							t.Fatalf("wrong ICMP error: %x", response)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+// BenchmarkICMPRecursiveErrorSuppression covers native and foreign protocol
+// numbers in both invoking IP families.
+func BenchmarkICMPRecursiveErrorSuppression(b *testing.B) {
+	for _, ipv6 := range []bool{false, true} {
+		for _, foreign := range []bool{false, true} {
+			b.Run(fmt.Sprintf("IPv6-%v/foreign-%v", ipv6, foreign), func(b *testing.B) {
+				source, target := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
+				protocol, messageType := byte(ProtocolICMPv4), byte(ICMPv4TypeDestinationUnreachable)
+				if ipv6 {
+					source, target = netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2")
+					protocol, messageType = ProtocolICMPv6, ICMPv6TypeDestinationUnreachable
+				}
+				if foreign {
+					if ipv6 {
+						protocol, messageType = ProtocolICMPv4, ICMPv4TypeDestinationUnreachable
+					} else {
+						protocol, messageType = ProtocolICMPv6, ICMPv6TypeDestinationUnreachable
+					}
+				}
+				wire := buildIPPacket(source, target, protocol, []byte{messageType, 0, 0, 0, 0, 0, 0, 0}, 1, true)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_ = packetInvokesICMPError(wire)
+				}
+			})
+		}
+	}
+}
+
 func TestICMPErrorRejectsCrossFamilyQuote(t *testing.T) {
 	for _, test := range []struct {
 		name     string

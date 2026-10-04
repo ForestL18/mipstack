@@ -140,8 +140,8 @@ const (
 	tcpSYNBacklog = 256
 	// tcpMaximumRTOs matches Linux's default tcp_retries2 budget for
 	// consecutive retransmission timeouts without cumulative acknowledgement
-	// progress. Fast recovery, tail probes, and PMTU resegmentation do not
-	// consume it.
+	// progress, and bounds consecutive unanswered persist probes. Fast
+	// recovery, tail-loss probes, and PMTU resegmentation do not consume it.
 	tcpMaximumRTOs = 15
 	// tcpActiveSYNMaximumAttempts is the initial SYN plus Linux's default six
 	// active-open retransmissions.
@@ -1887,9 +1887,12 @@ type tcpEstablishedPathMTUState struct {
 // next zero-window probe deadline instead. Persist cannot coexist with an
 // outstanding transmitted range, so the two modes safely share this storage.
 type tcpSendTimerState struct {
-	baseDeadline    time.Time
-	persistRTO      time.Duration
-	persistAttempts int
+	baseDeadline time.Time
+	persistRTO   time.Duration
+	// persistHostQueueToken identifies the last published probe's generation.
+	// Only its identity is retained: the queued time has already armed the
+	// deadline and is not needed to observe departure.
+	persistHostQueueToken uint64
 }
 
 // tcpEstablishedState contains protocol state owned by one established TCP
@@ -1989,6 +1992,10 @@ type tcpEstablishedState struct {
 	liveness, pathMTUProbe, pacing                       bool
 	retransmissionKind                                   tcpRetransmissionKind
 	frtoState                                            tcpFRTOState
+	// persistUnanswered is reset by a current ACK, even with a zero window.
+	// persistClosed is a finite post-Close resource-reclamation budget; peer
+	// responses must not remove that independent bound.
+	persistUnanswered, persistClosed uint8
 }
 
 // tcpFRTOState identifies the RFC 5682 step currently owned by RTO recovery.
@@ -2981,7 +2988,8 @@ func (s *tcpEstablishedState) updateRetransmissionTimer(update tcpRetransmission
 		s.persist = false
 		s.sendTimer.baseDeadline = time.Time{}
 		s.sendTimer.persistRTO = time.Second
-		s.sendTimer.persistAttempts = 0
+		s.persistUnanswered, s.persistClosed = 0, 0
+		s.sendTimer.persistHostQueueToken = 0
 	}
 	switch update {
 	case tcpRetransmissionRestart:
@@ -3037,8 +3045,8 @@ func tcpTimerOutputPending(state *tcpEstablishedState, hostQueueWaiting bool) bo
 // tcpPersistOutputPending reports a persist deadline that was consumed before
 // its zero-window probe could be published. A reopened peer window invalidates
 // the probe and lets ordinary output replace it from current send state.
-func tcpPersistOutputPending(state *tcpEstablishedState) bool {
-	return state.persist && state.sendTimer.baseDeadline.IsZero() && state.peerWindow == 0 && len(state.outstanding) == 0
+func tcpPersistOutputPending(state *tcpEstablishedState, hostQueueWaiting bool) bool {
+	return state.persist && !hostQueueWaiting && state.sendTimer.baseDeadline.IsZero() && state.peerWindow == 0 && len(state.outstanding) == 0
 }
 
 // armPersist schedules zero-window probing only when unsent sequence space is
@@ -3064,8 +3072,87 @@ func (s *tcpEstablishedState) armPersist(sentAt time.Time, total int, writeClose
 			s.sendTimer.baseDeadline = time.Time{}
 		}
 		s.sendTimer.persistRTO = time.Second
-		s.sendTimer.persistAttempts = 0
+		s.persistUnanswered, s.persistClosed = 0, 0
+		s.sendTimer.persistHostQueueToken = 0
 	}
+}
+
+// drainPersistOutput applies a due persist budget and publishes one probe.
+// For an open connection it registers the last unanswered probe's departure
+// at publication, so embedding-link delay cannot consume that response
+// interval.
+func (s *tcpEstablishedState) drainPersistOutput(first tcpOutputReservation) (*packetQueueDepartureWaiter, error) {
+	c := s.connection
+	outputWindow := newTCPOutputWindow(first)
+	defer func() { outputWindow.release() }()
+	if !tcpPersistOutputPending(s, false) {
+		return nil, nil
+	}
+	closed := c.applicationReceiveClosed()
+	if closed && s.persistClosed >= tcpMaximumRTOs {
+		// RFC 6429 permits reclaiming persist connections for resource policy.
+		// Preserve the full-Close drain bound independently of peer responses.
+		return nil, os.ErrDeadlineExceeded
+	}
+	if !closed && s.persistUnanswered >= tcpMaximumRTOs {
+		// RFC 9293 section 3.8.6.1 keeps a responding zero-window peer
+		// alive. Linux tcp_probe_timer bounds consecutive unanswered probes
+		// by tcp_retries2. The final probe's device-output wait has already ended.
+		var softError error
+		if s.livenessState != nil {
+			softError = s.livenessState.lastSoftError
+		}
+		return nil, tcpTimeoutError(softError)
+	}
+	reservation, remaining, available := outputWindow.reserve(c)
+	outputWindow = remaining
+	if !available {
+		return nil, nil
+	}
+	window, right := s.nextAdvertisedReceiveWindow()
+	var payload tcpPayloadView
+	payload.setBytes(tcpZeroWindowProbe[:])
+	// Linux probes with already acknowledged sequence space. Consuming a new
+	// byte would move pure ACKs beyond the peer's zero receive window.
+	published, err := c.publishReservedPayloadForMTU(s.sendUnacknowledged-1, s.receiveNext, TCPFlagACK, window, nil, &payload, false, c.mtu, reservation, tcpOutputSequenceRange{})
+	if errors.Is(err, errTCPOutputRouteChanged) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	s.sendTimer.persistHostQueueToken = published.hostQueue.token
+	s.commitAcknowledgment(window, right, false)
+	c.stack.stats.tcpZeroWindowProbes.Add(1)
+	// Retry accounting and backoff advance only for a published probe. A
+	// capacity shortage cannot consume either budget or shorten the interval.
+	if s.persistUnanswered < tcpMaximumRTOs {
+		s.persistUnanswered++
+	}
+	if closed && s.persistClosed < tcpMaximumRTOs {
+		s.persistClosed++
+	}
+	s.persist = false
+	s.sendTimer.persistRTO *= 2
+	if s.sendTimer.persistRTO > tcpMaximumRTO {
+		s.sendTimer.persistRTO = tcpMaximumRTO
+	}
+	total, writeClosed, _ := c.sendState()
+	s.armPersist(published.hostQueue.queuedTime(c.stack.timestampEpoch), total, writeClosed)
+	if !closed && s.persist && s.persistUnanswered == tcpMaximumRTOs {
+		// Register before the budget check can expire, including departure just
+		// before that deadline. The actor suspends this clock while queue-owned;
+		// ACK or Close can cancel the wait without discarding the next deadline.
+		waiter := published.hostQueue.departureWaiter(c.stack, c.inbound.notify)
+		if waiter == nil {
+			// A dequeue preceding registration has no retained departure stamp.
+			// Start here conservatively rather than shortening the interval by
+			// queue residence; this can delay, but never hasten, termination.
+			s.sendTimer.baseDeadline = time.Now().Add(s.sendTimer.persistRTO)
+		}
+		return waiter, nil
+	}
+	return nil, nil
 }
 
 // sackOptions builds bounded ACK options in the connection-local lazy
@@ -7459,6 +7546,18 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		if target := state.sendAutoTune.target(receivedAt, state.rtt.srtt, state.bytesAcknowledged, c.sendMaximum); target > 0 {
 			c.growSendCapacity(target)
 		}
+	} else if !oldACK {
+		// Linux tcp_ack clears icsk_probes_out and any earlier soft error for
+		// a current zero-window response (RFC 9293 section 3.8.6.1). Persist
+		// probes reuse acknowledged sequence space, so their ACK cannot advance
+		// SND.UNA; starting a new flight already clears persist accounting.
+		// Peer responses must not remove full Close's independent drain budget.
+		if state.persist {
+			state.persistUnanswered = 0
+		}
+		if state.livenessState != nil {
+			state.livenessState.lastSoftError = nil
+		}
 	}
 	dsack, hasDSACK := TCPSACKBlock{}, false
 	if state.peerSACK {
@@ -7777,9 +7876,9 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialReceive tcpInitialReceive) error {
 	state := newTCPEstablishedState(c, sendNext)
 	defer state.finish()
-	// An expired loss timer's departure wait is actor-local and identifies one
-	// exact queue generation. ACK, recovery, and route events can replace its
-	// scoreboard target without retaining the old ticket in connection state.
+	// A send timer's departure wait is actor-local and identifies one exact
+	// queue generation. ACK, recovery, and route events can invalidate a loss
+	// target or the final unanswered persist probe without blocking the actor.
 	var hostQueueWait *packetQueueDepartureWaiter
 	var hostQueueWaitTicket packetQueueTicket
 	// Coalesce liveness recalculation after receive batches, send-window
@@ -7940,7 +8039,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		// Consumed loss, persist, and keepalive work precedes ordinary ACK output.
 		// Keep current ACK state pending until that output publishes or inbound
 		// evidence cancels it.
-		if tcpTimerOutputPending(state, hostQueueWait != nil) || tcpPersistOutputPending(state) || keepAliveOutputWaiting {
+		if tcpTimerOutputPending(state, hostQueueWait != nil) || tcpPersistOutputPending(state, hostQueueWait != nil) || keepAliveOutputWaiting {
 			if first.queue != nil {
 				first.release()
 			}
@@ -7997,7 +8096,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		// An expired RTO, TLP, or persist probe owns the next available slot.
 		// Ordinary wakeups must not rearm its consumed deadline or publish data
 		// without the timer's post-publication accounting.
-		if tcpTimerOutputPending(state, hostQueueWait != nil) || tcpPersistOutputPending(state) {
+		if tcpTimerOutputPending(state, hostQueueWait != nil) || tcpPersistOutputPending(state, hostQueueWait != nil) {
 			if first.queue != nil {
 				first.release()
 			}
@@ -8357,53 +8456,6 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		outputWindow.release()
 		return nil
 	}
-	// drainPersistOutput publishes one expired zero-window probe. Publication
-	// statistics, retry accounting, and backoff advance only after the probe
-	// becomes visible, so a full device queue cannot manufacture probes or
-	// shorten their intervals.
-	drainPersistOutput := func(first tcpOutputReservation) error {
-		outputWindow := newTCPOutputWindow(first)
-		if !tcpPersistOutputPending(state) {
-			outputWindow.release()
-			return nil
-		}
-		reservation, outputWindow, available := outputWindow.reserve(c)
-		if !available {
-			outputWindow.release()
-			return nil
-		}
-		window, right := state.nextAdvertisedReceiveWindow()
-		var payload tcpPayloadView
-		payload.setBytes(tcpZeroWindowProbe[:])
-		// Like Linux and gVisor, probe with an already acknowledged byte.
-		// Consuming new sequence space here would move pure ACKs beyond the
-		// peer's zero window and can deadlock a full-duplex connection.
-		published, err := c.publishReservedPayloadForMTU(state.sendUnacknowledged-1, state.receiveNext, TCPFlagACK, window, nil, &payload, false, c.mtu, reservation, tcpOutputSequenceRange{})
-		if errors.Is(err, errTCPOutputRouteChanged) {
-			outputWindow.release()
-			return nil
-		}
-		if err != nil {
-			outputWindow.release()
-			return err
-		}
-		hostQueue := published.hostQueue
-		probeSentAt := hostQueue.queuedTime(c.stack.timestampEpoch)
-		state.commitAcknowledgment(window, right, false)
-		c.stack.stats.tcpZeroWindowProbes.Add(1)
-		if c.applicationReceiveClosed() {
-			state.sendTimer.persistAttempts++
-		}
-		state.persist = false
-		state.sendTimer.persistRTO *= 2
-		if state.sendTimer.persistRTO > tcpMaximumRTO {
-			state.sendTimer.persistRTO = tcpMaximumRTO
-		}
-		total, writeClosed, _ := c.sendState()
-		state.armPersist(probeSentAt, total, writeClosed)
-		outputWindow.release()
-		return nil
-	}
 	// drainKeepAliveOutput publishes one due idle-peer probe. The readiness bit
 	// retains no sequence or packet state; each attempt completes socket-state
 	// reads before its terminal check and publishes only with owned capacity.
@@ -8528,7 +8580,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 	// admission leaves the scoreboard unchanged for the next actor turn.
 	drainRecovery := func(first tcpOutputReservation) error {
 		outputWindow := newTCPOutputWindow(first)
-		if tcpTimerOutputPending(state, hostQueueWait != nil) || tcpPersistOutputPending(state) {
+		if tcpTimerOutputPending(state, hostQueueWait != nil) || tcpPersistOutputPending(state, hostQueueWait != nil) {
 			outputWindow.release()
 			return nil
 		}
@@ -8644,7 +8696,16 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 	for {
 		if hostQueueWait != nil {
 			matchingTarget := false
-			if state.retransmit && state.retransmissionKind != tcpRetransmissionClose {
+			persistWait := state.persist
+			persistTicketMatches := false
+			if persistWait {
+				persistTicketMatches = state.sendTimer.persistHostQueueToken == hostQueueWaitTicket.token
+				// The final open-connection probe remains the physical timer
+				// owner after a current ACK resets the unanswered budget. Keep
+				// waiting for this exact queue generation so its departure, rather
+				// than the old queue-admission deadline, starts the next interval.
+				matchingTarget = persistTicketMatches && !c.applicationReceiveClosed()
+			} else if state.retransmit && state.retransmissionKind != tcpRetransmissionClose {
 				index := state.retransmissionTarget(state.retransmissionKind)
 				matchingTarget = index >= 0 && state.outstanding[index].hostQueue.token == hostQueueWaitTicket.token
 			}
@@ -8652,7 +8713,18 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			if departed || !matchingTarget {
 				hostQueueWait = nil
 				hostQueueWaitTicket = packetQueueTicket{}
-				if state.retransmit && state.retransmissionKind == tcpRetransmissionPathMTU {
+				if persistWait {
+					// ACK or Close may cancel the retry budget while this exact
+					// probe generation is still the physical timer owner. Preserve
+					// its departure-based response interval even after that policy
+					// transition; matchingTarget alone would lose this timestamp.
+					if departed && persistTicketMatches {
+						// The final open-connection probe gets a full response interval
+						// after leaving the embedding queue. ACK or Close can cancel
+						// this wait.
+						state.sendTimer.baseDeadline = departedAt.Add(state.sendTimer.persistRTO)
+					}
+				} else if state.retransmit && state.retransmissionKind == tcpRetransmissionPathMTU {
 					// PMTU resegmentation is immediate transport work independent
 					// of the superseded loss-clock wait. Retain that reason so the
 					// returned capacity cannot turn it into an RTO or TLP.
@@ -8668,7 +8740,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			} else {
 				// ACK processing may have reselected a timer while the same
 				// generation remains queue-owned. Departure still owns its start.
-				state.retransmissionDeadline = time.Time{}
+				if !persistWait {
+					state.retransmissionDeadline = time.Time{}
+				}
 			}
 		}
 		if livenessDirty {
@@ -8676,7 +8750,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			livenessDirty = false
 		}
 		timerOutput := tcpTimerOutputPending(state, hostQueueWait != nil)
-		persistOutput := tcpPersistOutputPending(state)
+		persistOutput := tcpPersistOutputPending(state, hostQueueWait != nil)
 		keepAliveOutput := keepAliveOutputWaiting
 		recoveryOutput := false
 		if !timerOutput && recoveryOutputWaiting && !persistOutput && !keepAliveOutput {
@@ -8696,7 +8770,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			kind     int
 		}{
 			{state.retransmit && !recoveryOutput, state.retransmissionDeadline, actorTimerRetransmission},
-			{state.persist, state.sendTimer.baseDeadline, actorTimerPersist},
+			{state.persist && hostQueueWait == nil, state.sendTimer.baseDeadline, actorTimerPersist},
 			{state.delayedACK, state.delayedACKDeadline, actorTimerDelayedACK},
 			{state.liveness, state.livenessDeadline, actorTimerLiveness},
 			{state.pathMTUProbe, state.pathMTUDeadline, actorTimerPathMTU},
@@ -8765,8 +8839,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					return err
 				}
 			} else if persistOutput {
-				if err := drainPersistOutput(reservation); err != nil {
+				waiter, err := state.drainPersistOutput(reservation)
+				if err != nil {
 					return err
+				}
+				if waiter != nil {
+					hostQueueWait, hostQueueWaitTicket = waiter, packetQueueTicket{token: state.sendTimer.persistHostQueueToken}
 				}
 			} else if keepAliveOutput {
 				if err := drainKeepAliveOutput(reservation); err != nil {
@@ -9232,11 +9310,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			// The zero deadline distinguishes it from the next scheduled probe.
 			state.persist = true
 			state.sendTimer.baseDeadline = time.Time{}
-			if c.applicationReceiveClosed() && state.sendTimer.persistAttempts >= tcpMaximumRTOs {
-				return os.ErrDeadlineExceeded
-			}
-			if err := drainPersistOutput(tcpOutputReservation{}); err != nil {
+			waiter, err := state.drainPersistOutput(tcpOutputReservation{})
+			if err != nil {
 				return err
+			}
+			if waiter != nil {
+				hostQueueWait, hostQueueWaitTicket = waiter, packetQueueTicket{token: state.sendTimer.persistHostQueueToken}
 			}
 
 		case <-activeDelayedACK:

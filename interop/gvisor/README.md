@@ -17,8 +17,10 @@ The suite covers:
   half-close processing with blocked writers and paused packet reads,
   wildcard dual-stack listeners, closed-port and
   established-connection resets, keepalive restart after bidirectional data,
-  receive-window closure and reopening, SYN, SYN-ACK, final-ACK, FIN, and data
-  retransmission after deterministic loss or reordering;
+  receive-window closure and reopening, native zero-window probe responses,
+  SYN, SYN-ACK, final-ACK, FIN, and data
+  retransmission after deterministic loss or reordering, and SYN-cookie
+  recovery when Timestamp is removed from the SYN or final ACK;
 - Reordered cumulative ACKs refreshing Timestamp echoes and carrying native
   gVisor SACK feedback for selective recovery in both address families;
 - Reno, CUBIC, BBR, and BBRv3 mipstack senders recovering from loss against

@@ -239,6 +239,16 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 // bits. Timestamp and ECN flags are authenticated separately.
 func encodeSYNCookieOptions(syn tcpSegment, remoteAddress netip.Addr) (synCookieOptions, uint32) {
 	mss, scale, scaling, sack, timestamp, timestampValue := parseTCPOptions(syn.optionBytes(), defaultTCPPeerMSS(remoteAddress), 65535)
+	if !timestamp {
+		// RFC 7323 fixes the window scale during the SYN exchange, and RFC
+		// 2018 requires SACK-Permitted to be negotiated by both SYNs. Linux
+		// may advertise these options in a cookie SYN-ACK, then clear them
+		// when a cookie ACK lacks Timestamp because its stateless recovery
+		// carries them in the Timestamp echo. MIPStack suppresses them before
+		// advertising instead, so the handshake never promises extensions
+		// that the conservative recovery path will drop.
+		scale, scaling, sack = 0, false, false
+	}
 	mssIndex := 0
 	for index, value := range synCookieMSSValues {
 		if int(value) > mss {

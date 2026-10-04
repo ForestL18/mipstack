@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -528,41 +529,73 @@ func TestSYNCookieZeroTimestampEcho(t *testing.T) {
 }
 
 func TestSYNCookieWithoutTimestampClearsRecoveredExtensions(t *testing.T) {
-	local := netip.MustParseAddr("192.0.2.73")
-	remote := netip.MustParseAddr("198.51.100.73")
-	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
-	if err != nil {
-		t.Fatal(err)
+	for _, family := range []struct{ name, local, remote string }{
+		{"IPv4", "192.0.2.73", "198.51.100.73"},
+		{"IPv6", "2001:db8::73", "2001:db8:1::73"},
+	} {
+		for _, scale := range []byte{0, 7} {
+			t.Run(fmt.Sprintf("%s/scale-%d", family.name, scale), func(t *testing.T) {
+				local := netip.MustParseAddr(family.local)
+				remote := netip.MustParseAddr(family.remote)
+				stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = stack.Start(); err != nil {
+					t.Fatal(err)
+				}
+				defer stack.Close()
+				state := &tcpPassiveState{}
+				key := tcpKey{local: netip.AddrPortFrom(local, 443), remote: netip.AddrPortFrom(remote, 50000)}
+				syn := tcpSegment{sequence: 100, flags: TCPFlagSYN, window: 65535}
+				syn.setOptions([]byte{TCPHeaderOptionMSS, 4, 0x05, 0xb4, TCPHeaderOptionSACKPermitted, 2,
+					TCPHeaderOptionNOP, TCPHeaderOptionWindowScale, 3, scale})
+				if err = state.sendSYNCookie(stack, nil, key, syn, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+				packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
+				if !ok || len(packet.payload) < tcpHeaderSize {
+					t.Fatalf("invalid SYN-cookie packet: %+v", packet)
+				}
+				tcp := packet.payload
+				headerSize := int(tcp[12]>>4) * 4
+				if headerSize < tcpHeaderSize || headerSize > len(tcp) {
+					t.Fatalf("invalid SYN-cookie header size: %d", headerSize)
+				}
+				_, _, scaling, sack, timestamp, _ := parseTCPOptions(tcp[tcpHeaderSize:headerSize], 536, 65535)
+				if scaling || sack || timestamp {
+					t.Fatalf("no-timestamp SYN-cookie advertised scale:%v SACK:%v TS:%v; want no extensions", scaling, sack, timestamp)
+				}
+				ack := tcpSegment{sequence: syn.sequence + 1, acknowledgement: binary.BigEndian.Uint32(tcp[4:8]) + 1, flags: TCPFlagACK}
+				_, options, valid, attempted := state.validateSYNCookie(key, ack, time.Now())
+				if !attempted || !valid || options.windowScaling || options.sack || options.timestamp || options.mss != 1440 {
+					t.Fatalf("no-timestamp SYN-cookie validation = attempted:%v valid:%v options:%+v", attempted, valid, options)
+				}
+			})
+		}
 	}
-	if err = stack.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer stack.Close()
-	state := &tcpPassiveState{}
-	key := tcpKey{local: netip.AddrPortFrom(local, 443), remote: netip.AddrPortFrom(remote, 50000)}
-	syn := tcpSegment{sequence: 100, flags: TCPFlagSYN, window: 65535}
-	syn.setOptions([]byte{TCPHeaderOptionMSS, 4, 0x05, 0xb4, TCPHeaderOptionSACKPermitted, 2,
-		TCPHeaderOptionNOP, TCPHeaderOptionWindowScale, 3, 7})
-	if err = state.sendSYNCookie(stack, nil, key, syn, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
-	if !ok || len(packet.payload) < tcpHeaderSize {
-		t.Fatalf("invalid SYN-cookie packet: %+v", packet)
-	}
-	tcp := packet.payload
-	headerSize := int(tcp[12]>>4) * 4
-	if headerSize < tcpHeaderSize || headerSize > len(tcp) {
-		t.Fatalf("invalid SYN-cookie header size: %d", headerSize)
-	}
-	_, _, scaling, sack, timestamp, _ := parseTCPOptions(tcp[tcpHeaderSize:headerSize], 536, 65535)
-	if !scaling || !sack || timestamp {
-		t.Fatalf("no-timestamp SYN-cookie advertised scale:%v SACK:%v TS:%v; want SACK/window scaling without Timestamp", scaling, sack, timestamp)
-	}
-	ack := tcpSegment{sequence: syn.sequence + 1, acknowledgement: binary.BigEndian.Uint32(tcp[4:8]) + 1, flags: TCPFlagACK}
-	_, options, valid, attempted := state.validateSYNCookie(key, ack, time.Now())
-	if !attempted || !valid || options.windowScaling || options.sack || options.timestamp || options.mss != 1440 {
-		t.Fatalf("no-timestamp SYN-cookie validation = attempted:%v valid:%v options:%+v", attempted, valid, options)
+}
+
+// BenchmarkSYNCookieOptionEncoding separates timestamp-backed negotiation
+// from the no-timestamp fallback on the stateless handshake path.
+func BenchmarkSYNCookieOptionEncoding(b *testing.B) {
+	for _, timestamp := range []bool{false, true} {
+		b.Run(fmt.Sprintf("timestamp-%v", timestamp), func(b *testing.B) {
+			remote := netip.MustParseAddr("198.51.100.73")
+			syn := tcpSegment{flags: TCPFlagSYN}
+			options := []byte{2, 4, 0x05, 0xb4, 4, 2, 1, 3, 3, 7}
+			if timestamp {
+				options = append(options, tcpTimestampOptions(100, 0)...)
+			}
+			syn.setOptions(options)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if options, _ := encodeSYNCookieOptions(syn, remote); options.mss == 0 {
+					b.Fatal("missing MSS")
+				}
+			}
+		})
 	}
 }
 

@@ -606,9 +606,9 @@ func TestTCPHighFrequencyTimestampInterop(t *testing.T) {
 
 // TestTCPSYNCookieOptionRecoveryInterop verifies that native gVisor
 // connections can complete through a mipstack SYN-cookie when a middlebox
-// removes Timestamp or clears TSecr in the final ACK. The first half-open
-// handshake fills the SYN backlog; the second handshake is validated from the
-// wire and restores only the extensions proved by the received options.
+// removes Timestamp from the SYN or final ACK, or clears the final TSecr.
+// The first half-open handshake fills the SYN backlog; the second is validated
+// from the wire and restores only the extensions proved by the received options.
 func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 	scenarios := []struct {
 		name             string
@@ -617,7 +617,9 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 		wantWindowScale  bool
 		wantPeerScale    uint8
 		wantReceiveScale bool
+		stripSYN         bool
 	}{
+		{name: "no-timestamp-syn", rewrite: stripTCPTimestamp, stripSYN: true},
 		{name: "missing-timestamp", rewrite: stripTCPTimestamp},
 		{name: "zero-tsecr", rewrite: func(packet []byte) bool {
 			return rewriteTCPTimestamps(packet, func(value, _ uint32) (uint32, uint32) { return value, 0 })
@@ -633,15 +635,26 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 					firstClientPort := serverPort + 1
 					secondClientPort := serverPort + 2
 					var (
-						firstACKDropped atomic.Bool
-						rewrittenACK    atomic.Bool
+						firstACKDropped     atomic.Bool
+						rewrittenHandshake  atomic.Bool
+						cookieSYNACKChecked atomic.Bool
+						cookieSYNACKInvalid atomic.Bool
 					)
 					network := newInteropNetworkWithOptions(t, interopNetworkOptions{
 						families: []interopFamily{family},
 						mtu:      1500,
 						gvisorToMipstack: func(packet []byte) bool {
 							tcpHeader, _, ok := tcpSegment(packet)
-							if !ok || tcpHeader.DestinationPort() != serverPort || tcpHeader.Flags().Contains(header.TCPFlagSyn) || !tcpHeader.Flags().Contains(header.TCPFlagAck) {
+							if !ok || tcpHeader.DestinationPort() != serverPort {
+								return true
+							}
+							if tcpHeader.Flags().Contains(header.TCPFlagSyn) {
+								if scenario.stripSYN && tcpHeader.SourcePort() == secondClientPort && scenario.rewrite(packet) {
+									rewrittenHandshake.Store(true)
+								}
+								return true
+							}
+							if !tcpHeader.Flags().Contains(header.TCPFlagAck) {
 								return true
 							}
 							switch tcpHeader.SourcePort() {
@@ -649,12 +662,24 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 								firstACKDropped.Store(true)
 								return false
 							case secondClientPort:
-								if rewrittenACK.CompareAndSwap(false, true) {
+								if !scenario.stripSYN && rewrittenHandshake.CompareAndSwap(false, true) {
 									if !scenario.rewrite(packet) {
-										rewrittenACK.Store(false)
+										rewrittenHandshake.Store(false)
 									}
 								}
 							}
+							return true
+						},
+						mipstackToGVisor: func(packet []byte) bool {
+							tcpHeader, _, ok := tcpSegment(packet)
+							if !scenario.stripSYN || !ok || tcpHeader.DestinationPort() != secondClientPort || !tcpHeader.Flags().Contains(header.TCPFlagSyn|header.TCPFlagAck) {
+								return true
+							}
+							options := header.ParseSynOptions(tcpHeader.Options(), true)
+							if options.TS || options.WS != -1 || options.SACKPermitted {
+								cookieSYNACKInvalid.Store(true)
+							}
+							cookieSYNACKChecked.Store(true)
 							return true
 						},
 					})
@@ -701,11 +726,14 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 					}
 					defer second.Close()
 					rewriteDeadline := time.Now().Add(2 * time.Second)
-					for !rewrittenACK.Load() && time.Now().Before(rewriteDeadline) {
+					for !rewrittenHandshake.Load() && time.Now().Before(rewriteDeadline) {
 						time.Sleep(time.Millisecond)
 					}
-					if !rewrittenACK.Load() {
-						t.Fatalf("SYN-cookie final ACK was not rewritten for %s", scenario.name)
+					if !rewrittenHandshake.Load() {
+						t.Fatalf("SYN-cookie handshake was not rewritten for %s", scenario.name)
+					}
+					if scenario.stripSYN && (!cookieSYNACKChecked.Load() || cookieSYNACKInvalid.Load()) {
+						t.Fatal("cookie SYN-ACK negotiated SACK, window scaling or Timestamp without a timestamped SYN")
 					}
 					accepted, err := listener.Accept()
 					if err != nil {
@@ -724,8 +752,12 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 					if listenerInfo.SYNCookiesSent == 0 || listenerInfo.SYNCookiesAccepted == 0 {
 						t.Fatalf("SYN-cookie counters = sent:%d accepted:%d", listenerInfo.SYNCookiesSent, listenerInfo.SYNCookiesAccepted)
 					}
-					exchangeTCPPayload(t, second, accepted, patternedPayload(4096, 43))
-					exchangeTCPPayload(t, accepted, second, patternedPayload(4096, 47))
+					payloadSize := 4096
+					if scenario.stripSYN {
+						payloadSize = 128 * 1024
+					}
+					exchangeTCPPayload(t, second, accepted, patternedPayload(payloadSize, 43))
+					exchangeTCPPayload(t, accepted, second, patternedPayload(payloadSize, 47))
 
 					select {
 					case connection := <-firstResult:
@@ -2484,6 +2516,80 @@ func TestTCPReceiveWindowReopenInterop(t *testing.T) {
 	}
 }
 
+// TestTCPPersistProbeResponseInterop verifies that native gVisor zero-window
+// replies keep mipstack's sender alive and that reads reopen the window.
+func TestTCPPersistProbeResponseInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		t.Run(family.name, func(t *testing.T) {
+			var probes, responses atomic.Uint32
+			var peerACK, probeSequence atomic.Uint32
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					segment, _, ok := tcpSegment(packet)
+					if ok && segment.Flags().Contains(header.TCPFlagAck) && !segment.Flags().Contains(header.TCPFlagSyn) {
+						peerACK.Store(segment.AckNumber())
+						if probes.Load() != 0 && segment.WindowSize() == 0 && segment.AckNumber() == probeSequence.Load()+1 {
+							responses.Add(1)
+						}
+					}
+					return true
+				},
+				mipstackToGVisor: func(packet []byte) bool {
+					segment, size, ok := tcpSegment(packet)
+					if ok && size == 1 && segment.Flags() == header.TCPFlagAck && segment.SequenceNumber()+1 == peerACK.Load() {
+						probeSequence.Store(segment.SequenceNumber())
+						probes.Add(1)
+					}
+					return true
+				},
+			})
+			limits := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 4096, Max: 4096}
+			if err := network.gvisor.SetTransportProtocolOption(tcp.ProtocolNumber, &limits); err != nil {
+				t.Fatalf("set gVisor receive limits: %s", err.String())
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			client, server, listener := openTCPPair(t, ctx, network, family, false)
+			defer listener.Close()
+			defer server.Close()
+			defer client.Close()
+			deadline := time.Now().Add(15 * time.Second)
+			if err := client.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			if err := server.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			payload := patternedPayload(256*1024, 159)
+			written := make(chan error, 1)
+			go func() {
+				n, err := client.Write(payload)
+				if err == nil && n != len(payload) {
+					err = io.ErrShortWrite
+				}
+				written <- err
+			}()
+			probeDeadline := time.Now().Add(10 * time.Second)
+			for (probes.Load() < 2 || responses.Load() < 2) && time.Now().Before(probeDeadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			connection := client.(*mipstack.TCPConn)
+			if info := connection.Info(); probes.Load() < 2 || responses.Load() < 2 || info.PeerWindow != 0 || info.State != mipstack.TCPStateEstablished {
+				t.Fatalf("zero-window replies: probes=%d responses=%d info=%+v", probes.Load(), responses.Load(), info)
+			}
+			received := make([]byte, len(payload))
+			if _, err := io.ReadFull(server, received); err != nil || !bytes.Equal(received, payload) {
+				t.Fatalf("read after reopening gVisor window: %v", err)
+			}
+			if err := <-written; err != nil {
+				t.Fatal(err)
+			}
+			exchangeTCPPayload(t, server, client, patternedPayload(4096, 161))
+		})
+	}
+}
+
 // TestTCPZeroWindowFINInterop verifies that a FIN-only segment is consumed at
 // RCV.NXT while mipstack's application receive buffer is full. The bridge
 // counts FINs so a delayed close caused by peer retransmission cannot pass.
@@ -2838,7 +2944,7 @@ func stripTCPTimestamp(packet []byte) bool {
 	}
 	tcpHeader := header.TCP(packet[transportOffset:wireEnd])
 	oldHeaderSize := int(tcpHeader.DataOffset())
-	if oldHeaderSize < header.TCPMinimumSize || oldHeaderSize > len(tcpHeader) || tcpHeader.Flags().Contains(header.TCPFlagSyn) {
+	if oldHeaderSize < header.TCPMinimumSize || oldHeaderSize > len(tcpHeader) {
 		return false
 	}
 	var compact [40]byte

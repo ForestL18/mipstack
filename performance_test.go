@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -85,6 +86,18 @@ func benchmarkTCPControllerConnection(b *testing.B, algorithm string, mtu uint32
 	return connection, server, bridge
 }
 
+// BenchmarkTCPEstablishedStateAllocation measures the allocator's effective
+// per-actor size, including any runtime header for pointer-bearing objects.
+func BenchmarkTCPEstablishedStateAllocation(b *testing.B) {
+	states := make([]*tcpEstablishedState, 128)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		states[i%len(states)] = &tcpEstablishedState{}
+	}
+	runtime.KeepAlive(states)
+}
+
 func BenchmarkTCPControllerThroughput(b *testing.B) {
 	const size = 4 * 1024 * 1024
 	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
@@ -139,6 +152,64 @@ func BenchmarkTCPControllerThroughput(b *testing.B) {
 				b.ReportMetric(float64(bridge.peerDSACKs), "peer-dsack-acks")
 				bridge.mu.Unlock()
 			}
+		})
+	}
+}
+
+// BenchmarkTCPControllerFixedBufferThroughput holds both sockets' buffer
+// capacities constant so automatic tuning cannot change the allocation cost.
+func BenchmarkTCPControllerFixedBufferThroughput(b *testing.B) {
+	const size = 4 * 1024 * 1024
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		b.Run(algorithm, func(b *testing.B) {
+			connection, peer, _ := benchmarkTCPControllerConnection(b, algorithm, defaultMTU, false, RXChecksumOffload{})
+			sender := connection.(*TCPConn)
+			peer.mu.Lock()
+			receiver := peer.tcp[tcpKey{local: sender.key.remote, remote: sender.key.local}]
+			peer.mu.Unlock()
+			if receiver == nil {
+				b.Fatal("fixed-buffer benchmark has no peer connection")
+			}
+			for _, c := range []*TCPConn{sender, receiver} {
+				if err := c.SetReadBuffer(tcpReceiveCapacity); err != nil {
+					b.Fatal(err)
+				}
+				if err := c.SetWriteBuffer(tcpSendCapacity); err != nil {
+					b.Fatal(err)
+				}
+			}
+			payload := bytes.Repeat([]byte{0x5a}, size)
+			received := make([]byte, size)
+			b.ReportAllocs()
+			b.SetBytes(2 * size)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				written := make(chan error, 1)
+				go func() {
+					n, err := connection.Write(payload)
+					if err == nil && n != len(payload) {
+						err = io.ErrShortWrite
+					}
+					written <- err
+				}()
+				if _, err := io.ReadFull(connection, received); err != nil {
+					b.Fatal(err)
+				}
+				if err := <-written; err != nil {
+					b.Fatal(err)
+				}
+				if !bytes.Equal(received, payload) {
+					b.Fatal("fixed-buffer echo payload mismatch")
+				}
+			}
+			b.StopTimer()
+			for _, c := range []*TCPConn{sender, receiver} {
+				info := c.Info()
+				if info.SendBufferCapacity != tcpSendCapacity || info.ReceiveBufferCapacity != tcpReceiveCapacity {
+					b.Fatalf("fixed socket buffers changed: %+v", info)
+				}
+			}
+			b.ReportMetric(float64(sender.Info().Retransmissions+receiver.Info().Retransmissions), "retransmissions")
 		})
 	}
 }

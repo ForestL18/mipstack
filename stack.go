@@ -1922,7 +1922,7 @@ type packetQueueDepartureWaiter struct {
 	departedAt atomic.Int64
 }
 
-// packetQueueDepartureWaiters is allocated only after a loss timer encounters
+// packetQueueDepartureWaiters is allocated only after a send timer encounters
 // a packet still owned by the queue. Ordinary stacks retain no per-slot waiter
 // storage.
 type packetQueueDepartureWaiters struct {

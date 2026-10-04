@@ -1340,20 +1340,24 @@ func (s *Stack) sendFragmentReassemblyTimeout(entry *ipPacketReassemblyEntry) er
 // packetInvokesICMPError follows a complete or first-fragment header chain
 // and applies the RFC 792/RFC 4443 recursive-error suppression rule.
 func packetInvokesICMPError(packet []byte) bool {
-	_, _, protocol, payload, ok := quotedIPPayload(packet)
+	source, _, protocol, payload, ok := quotedIPPayload(packet)
 	if !ok || len(payload) == 0 {
 		return false
 	}
-	if protocol == ProtocolICMPv6 {
-		return payload[0] < 128
-	}
-	if protocol == ProtocolICMPv4 {
+	// RFC 1122 section 3.2.2 and RFC 4443 section 2.4 suppress errors
+	// only for the invoking family's ICMP protocol. Linux likewise checks
+	// IPPROTO_ICMP in IPv4 and IPPROTO_ICMPV6 after IPv6 extension headers.
+	if source.Is4() {
+		if protocol != ProtocolICMPv4 {
+			return false
+		}
 		switch payload[0] {
 		case ICMPv4TypeDestinationUnreachable, 4, 5, ICMPv4TypeTimeExceeded, ICMPv4TypeParameterProblem:
 			return true
 		}
+		return false
 	}
-	return false
+	return protocol == ProtocolICMPv6 && payload[0] < 128
 }
 
 // parseICMPError extracts the quoted original packet from an ICMP error.

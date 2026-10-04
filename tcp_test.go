@@ -5935,6 +5935,577 @@ func TestTCPEstablishedActorsShareReturnedOutputCapacity(t *testing.T) {
 	}
 }
 
+// TestTCPPersistRetryBudgets exercises the actor's production probe publisher
+// at the budget boundary without changing the protocol's real backoff clock.
+func TestTCPPersistRetryBudgets(t *testing.T) {
+	for _, test := range []struct {
+		name                     string
+		unanswered, closedProbes uint8
+		closed, readClosed       bool
+		softError, wantError     error
+	}{
+		{name: "open last probe", unanswered: tcpMaximumRTOs - 1},
+		{name: "open exhausted", unanswered: tcpMaximumRTOs, wantError: os.ErrDeadlineExceeded},
+		{name: "open soft failure", unanswered: tcpMaximumRTOs, softError: syscall.EHOSTUNREACH, wantError: syscall.EHOSTUNREACH},
+		{name: "read half close last probe", readClosed: true, unanswered: tcpMaximumRTOs - 1},
+		{name: "read half close exhausted", readClosed: true, unanswered: tcpMaximumRTOs, wantError: os.ErrDeadlineExceeded},
+		{name: "full close independent budget", closed: true, unanswered: tcpMaximumRTOs, closedProbes: tcpMaximumRTOs - 1},
+		{name: "full close exhausted", closed: true, closedProbes: tcpMaximumRTOs, wantError: os.ErrDeadlineExceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			local, remote := netip.MustParseAddr("192.0.2.191"), netip.MustParseAddr("198.51.100.191")
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			c := newTCPConn(stack, "tcp4", tcpKey{local: netip.AddrPortFrom(local, 12345), remote: netip.AddrPortFrom(remote, 80)}, 1500, tcpSocketOptionSet{})
+			c.receiveNext = 200
+			c.userClosed, c.readClosed = test.closed, test.readClosed
+			c.sendBuffer.append([]byte("queued"))
+			state := newTCPEstablishedState(c, 100)
+			defer state.finish()
+			state.persist = true
+			state.persistUnanswered, state.persistClosed = test.unanswered, test.closedProbes
+			if test.softError != nil {
+				state.ensureLivenessState().lastSoftError = test.softError
+			}
+			// A capacity-selected reservation must also be returned on timeout.
+			slot, available := stack.outbound.tryReserve()
+			if !available {
+				t.Fatal("no output slot")
+			}
+			waiter, err := state.drainPersistOutput(tcpOutputReservation{queue: &stack.outbound, slot: slot})
+			wantWaiter := test.wantError == nil && !test.closed
+			if !errors.Is(err, test.wantError) || (waiter != nil) != wantWaiter {
+				t.Fatalf("persist = %v, waiter %v; want %v", err, waiter, test.wantError)
+			}
+			if test.wantError != nil {
+				if stack.Stats().TCPZeroWindowProbes != 0 || len(stack.outbound.free) != cap(stack.outbound.free) {
+					t.Fatal("timeout published a probe or leaked its reservation")
+				}
+				return
+			}
+			wire := readOutboundPacket(t, stack)
+			packet, ok := parseIPPacket(wire, false)
+			if !ok || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+				t.Fatalf("invalid probe: %x", wire)
+			}
+			segment := packet.payload
+			headerSize := int(segment[12]>>4) * 4
+			if binary.BigEndian.Uint32(segment[4:8]) != 99 || binary.BigEndian.Uint32(segment[8:12]) != 200 || segment[13] != TCPFlagACK || !bytes.Equal(segment[headerSize:], tcpZeroWindowProbe[:]) || transportChecksum(local, remote, ProtocolTCP, segment) != 0 {
+				t.Fatalf("invalid probe sequence, flags, payload or checksum: %x", wire)
+			}
+			wantClosed := test.closedProbes
+			if test.closed {
+				wantClosed++
+			}
+			if state.persistUnanswered != tcpMaximumRTOs || state.persistClosed != wantClosed || stack.Stats().TCPZeroWindowProbes != 1 || state.sendNext != 100 {
+				t.Fatalf("probe accounting = %+v, stats %+v", state.sendTimer, stack.Stats())
+			}
+		})
+	}
+}
+
+func TestTCPPersistACKResetsOnlyUnansweredBudget(t *testing.T) {
+	for _, old := range []bool{false, true} {
+		t.Run(fmt.Sprintf("old-%v", old), func(t *testing.T) {
+			c := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			state := tcpEstablishedState{connection: c, sendUnacknowledged: 100, sendNext: 100, bytesAcknowledged: 100, peerMSS: 1200, peerWindow: 0, congestionWindow: 12000, slowStartThreshold: 12000,
+				persist: true, persistUnanswered: 14, persistClosed: 9, controller: newTCPCongestionController(CongestionControlReno)}
+			state.ensureLivenessState().lastSoftError = syscall.EHOSTUNREACH
+			ack := uint32(100)
+			if old {
+				ack--
+			}
+			segment := tcpSegment{sequence: 200, acknowledgement: ack, flags: TCPFlagACK, window: 0}
+			state.processAcknowledgment(&segment, time.Now(), 0)
+			want := uint8(0)
+			if old {
+				want = 14
+			}
+			if state.persistUnanswered != want || state.persistClosed != 9 || state.peerWindow != 0 {
+				t.Fatalf("ACK budget = %+v, window %d", state.sendTimer, state.peerWindow)
+			}
+			if old && !errors.Is(state.livenessState.lastSoftError, syscall.EHOSTUNREACH) || !old && state.livenessState.lastSoftError != nil {
+				t.Fatalf("ACK soft error = %v, old:%v", state.livenessState.lastSoftError, old)
+			}
+			state.persist = true
+			state.persistUnanswered = tcpMaximumRTOs
+			var wantError error = os.ErrDeadlineExceeded
+			if old {
+				wantError = syscall.EHOSTUNREACH
+			}
+			if _, err := state.drainPersistOutput(tcpOutputReservation{}); !errors.Is(err, wantError) {
+				t.Fatalf("exhausted budget error = %v", err)
+			}
+			state.livenessState = nil
+			state.persistUnanswered = 14
+			state.processAcknowledgment(&segment, time.Now(), 0)
+			if state.livenessState != nil || state.persistUnanswered != want {
+				t.Fatal("persist response allocated liveness state or changed old-ACK accounting")
+			}
+		})
+	}
+}
+
+// TestTCPPersistACKClearsSoftErrorWithoutProbeBudget verifies that a valid
+// current ACK clears an asynchronous soft error even before a persist probe
+// has been published. Old ACKs remain diagnostic-only and retain that error.
+func TestTCPPersistACKClearsSoftErrorWithoutProbeBudget(t *testing.T) {
+	for _, old := range []bool{false, true} {
+		t.Run(fmt.Sprintf("old-%v", old), func(t *testing.T) {
+			c := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			state := tcpEstablishedState{
+				connection: c, sendUnacknowledged: 100, sendNext: 100,
+				bytesAcknowledged: 100, peerMSS: 1200, peerWindow: 0,
+				congestionWindow: 12000, slowStartThreshold: 12000,
+				controller: newTCPCongestionController(CongestionControlReno),
+			}
+			state.ensureLivenessState().lastSoftError = syscall.EHOSTUNREACH
+			ack := uint32(100)
+			if old {
+				ack--
+			}
+			state.processAcknowledgment(&tcpSegment{sequence: 200, acknowledgement: ack, flags: TCPFlagACK, window: 0}, time.Now(), 0)
+			if old {
+				if !errors.Is(state.livenessState.lastSoftError, syscall.EHOSTUNREACH) {
+					t.Fatalf("old ACK cleared soft error: %v", state.livenessState.lastSoftError)
+				}
+			} else if state.livenessState.lastSoftError != nil {
+				t.Fatalf("current ACK retained soft error: %v", state.livenessState.lastSoftError)
+			}
+		})
+	}
+}
+
+func TestTCPPersistBudgetWaitsForProbeDeparture(t *testing.T) {
+	local, remote := netip.MustParseAddr("192.0.2.192"), netip.MustParseAddr("198.51.100.192")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	c := newTCPConn(stack, "tcp4", tcpKey{local: netip.AddrPortFrom(local, 12345), remote: netip.AddrPortFrom(remote, 80)}, 1500, tcpSocketOptionSet{})
+	c.sendBuffer.append([]byte("queued"))
+	state := newTCPEstablishedState(c, 100)
+	defer state.finish()
+	state.persist = true
+	state.persistUnanswered = tcpMaximumRTOs - 1
+	waiter, err := state.drainPersistOutput(tcpOutputReservation{})
+	if waiter == nil || err != nil {
+		t.Fatalf("last probe = %v, %v", waiter, err)
+	}
+	if !state.sendTimer.baseDeadline.After(time.Now()) || tcpPersistOutputPending(state, true) {
+		t.Fatal("last probe did not register departure before its response deadline")
+	}
+	if _, departed := waiter.departedTime(stack.timestampEpoch); departed {
+		t.Fatal("probe departed before Stack.Read")
+	}
+	buffers, sizes := [][]byte{make([]byte, 1500)}, make([]int, 1)
+	if n, err := stack.Read(buffers, sizes, 0); err != nil || n != 1 {
+		t.Fatalf("Stack.Read = %d, %v", n, err)
+	}
+	if _, departed := waiter.departedTime(stack.timestampEpoch); !departed {
+		t.Fatal("Stack.Read did not complete departure waiter")
+	}
+	state.sendTimer.baseDeadline = time.Time{}
+	if _, err := state.drainPersistOutput(tcpOutputReservation{}); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("departed exhausted budget = %v", err)
+	}
+	if stack.Stats().TCPZeroWindowProbes != 1 {
+		t.Fatal("departure wait published another probe")
+	}
+}
+
+// TestTCPPersistDepartureActor exercises the established actor's terminal
+// probe wait, including timer rearming and independent liveness deadlines.
+func TestTCPPersistDepartureActor(t *testing.T) {
+	for _, family := range []struct{ name, local, remote string }{
+		{"IPv4", "192.0.2.196", "198.51.100.196"},
+		{"IPv6", "2001:db8::196", "2001:db8:1::196"},
+	} {
+		for _, scenario := range []string{"departure interval", "current ACK after departure", "current ACK", "old ACK", "future ACK", "stale Timestamp", "window reopen", "full Close", "user timeout"} {
+			t.Run(family.name+"/"+scenario, func(t *testing.T) {
+				local, remote := netip.MustParseAddr(family.local), netip.MustParseAddr(family.remote)
+				stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if scenario == "departure interval" || scenario == "current ACK after departure" {
+					// An older fixture epoch allows a controlled departure event
+					// to represent most of the response interval already elapsed.
+					stack.timestampEpoch = time.Now().Add(-2 * tcpMaximumRTO)
+					stack.outbound.epoch = stack.timestampEpoch
+					stack.loopback.epoch = stack.timestampEpoch
+				}
+				t.Cleanup(func() { _ = stack.Close() })
+				if err = stack.Start(); err != nil {
+					t.Fatal(err)
+				}
+				network := "tcp4"
+				if local.Is6() {
+					network = "tcp6"
+				}
+				c := newTCPConn(stack, network, tcpKey{local: netip.AddrPortFrom(local, 12345), remote: netip.AddrPortFrom(remote, 80)}, 1500, tcpSocketOptionSet{})
+				c.receiveNext, c.peerWindow, c.peerMSS = 200, 65535, 1460
+				if scenario == "stale Timestamp" {
+					c.peerTimestamp, c.recentTimestamp = true, 300
+				}
+				c.sendBuffer.append([]byte{1})
+				stack.mu.Lock()
+				stack.tcp[c.key] = c
+				stack.stats.activeTCPConnections.Add(1)
+				stack.mu.Unlock()
+				actorTimer := newOwnedTimer()
+				go func() {
+					defer stack.removeTCP(c)
+					defer close(c.done)
+					defer actorTimer.close()
+					c.finish(c.established(100, actorTimer, tcpInitialReceive{}))
+				}()
+				c.wakeActor(tcpActorWakeSend)
+				t.Cleanup(func() {
+					c.abort(net.ErrClosed)
+					select {
+					case <-c.done:
+					case <-time.After(2 * time.Second):
+						t.Error("persist actor did not terminate")
+					}
+				})
+				// A completed byte gives an old ACK a valid history bound. The
+				// actor starts after handshake so this test owns its physical timer.
+				_ = readOutboundPacket(t, stack)
+				deliver := func(ack uint32, window uint16) {
+					t.Helper()
+					wire := buildTestTCP(remote, local, 80, 12345, 200, ack, TCPFlagACK, window, nil, nil)
+					if err := writeTestPacket(stack, wire); err != nil {
+						t.Fatal(err)
+					}
+					_ = c.Info()
+					_ = c.Info()
+				}
+				deliver(101, 0)
+				if info := c.Info(); info.BytesAcknowledged != 1 || info.PeerWindow != 0 {
+					t.Fatalf("initial zero-window ACK = %+v", info)
+				}
+				if _, err := c.Write([]byte("queued")); err != nil {
+					t.Fatal(err)
+				}
+				// An unbuffered diagnostic response parks the sole timer owner.
+				// Stop/drain/Reset is then safe under Go 1.20 as well as Go 1.26;
+				// no production deadline, backoff value or timer state is replaced.
+				withActorPaused := func(action func()) {
+					t.Helper()
+					response := make(chan TCPConnInfo)
+					c.mu.Lock()
+					if c.pending == nil {
+						c.pending = new(tcpPendingEvents)
+					}
+					c.pending.infoRequests = append(c.pending.infoRequests, response)
+					c.mu.Unlock()
+					c.wakeActor(tcpActorWakeInfo)
+					defer func() {
+						select {
+						case <-response:
+						case <-c.done:
+						case <-time.After(2 * time.Second):
+							t.Error("persist actor did not release its diagnostic response")
+						}
+					}()
+					waitFor(t, 2*time.Second, func() bool {
+						c.mu.Lock()
+						defer c.mu.Unlock()
+						return c.pending == nil || len(c.pending.infoRequests) == 0
+					})
+					select {
+					case <-c.done:
+						t.Fatalf("persist actor terminated before timer control: %+v", c.Info())
+					default:
+					}
+					action()
+				}
+				firePersist := func() {
+					t.Helper()
+					// A previous send wake may have changed the logical deadline
+					// before its Info reply; the next turn arms the physical timer.
+					_ = c.Info()
+					withActorPaused(func() {
+						if !actorTimer.active {
+							t.Fatal("persist deadline has no active physical timer")
+						}
+						if !actorTimer.timer.Stop() {
+							<-actorTimer.timer.C
+						}
+						actorTimer.timer.Reset(0)
+					})
+				}
+				for count := uint64(1); count <= tcpMaximumRTOs; count++ {
+					firePersist()
+					waitFor(t, time.Second, func() bool { return stack.Stats().TCPZeroWindowProbes == count })
+					if count < tcpMaximumRTOs {
+						_ = readOutboundPacket(t, stack)
+					}
+				}
+				var waiter *packetQueueDepartureWaiter
+				waitFor(t, time.Second, func() bool {
+					waiters := stack.outbound.departureWaiters.Load()
+					if waiters == nil {
+						return false
+					}
+					for index := range waiters.slots {
+						if current := waiters.slots[index].Load(); current != nil {
+							waiter = current
+							return true
+						}
+					}
+					return false
+				})
+				withActorPaused(func() {
+					if actorTimer.active {
+						t.Fatal("queue-owned final probe retained an active retry timer")
+					}
+				})
+				if info := c.Info(); info.State != TCPStateEstablished || stack.Stats().TCPZeroWindowProbes != tcpMaximumRTOs {
+					t.Fatalf("queued terminal probe = %+v", info)
+				}
+				switch scenario {
+				case "departure interval":
+					var responseDeadline time.Time
+					withActorPaused(func() {
+						buffers, sizes := [][]byte{make([]byte, 1500)}, make([]int, 1)
+						if n, err := stack.Read(buffers, sizes, 0); err != nil || n != 1 {
+							t.Fatalf("Stack.Read = %d, %v", n, err)
+						}
+						if _, departed := waiter.departedTime(stack.timestampEpoch); !departed {
+							t.Fatal("Stack.Read did not complete the final probe's waiter")
+						}
+						// Preserve the real dequeue and wake, but model a departure
+						// with 250 ms left in the full, capped response interval.
+						// Shorter intervals close early; longer ones miss the bound.
+						departedAt := time.Now().Add(-tcpMaximumRTO + 250*time.Millisecond)
+						waiter.departedAt.Store(int64(monotonicStampAt(stack.timestampEpoch, departedAt)))
+						responseDeadline = departedAt.Add(tcpMaximumRTO)
+					})
+					_ = c.Info()
+					_ = c.Info()
+					withActorPaused(func() {
+						select {
+						case expiredAt := <-actorTimer.timer.C:
+							// Timer values record the scheduled expiry, excluding
+							// dispatch delay while the actor is deliberately paused.
+							if difference := expiredAt.Sub(responseDeadline); difference < -20*time.Millisecond || difference > 20*time.Millisecond {
+								t.Fatalf("persist expiry = %v, want %v", expiredAt, responseDeadline)
+							}
+							// Replace the consumed tick for its sole production owner.
+							actorTimer.timer.Reset(0)
+						case <-time.After(2 * time.Second):
+							t.Fatal("persist timer did not use the full departure-based interval")
+						}
+					})
+				case "current ACK after departure":
+					withActorPaused(func() {
+						buffers, sizes := [][]byte{make([]byte, 1500)}, make([]int, 1)
+						if n, err := stack.Read(buffers, sizes, 0); err != nil || n != 1 {
+							t.Fatalf("Stack.Read = %d, %v", n, err)
+						}
+						if _, departed := waiter.departedTime(stack.timestampEpoch); !departed {
+							t.Fatal("Stack.Read did not complete the final probe's waiter")
+						}
+						// Keep the final probe's response deadline close enough to test
+						// without waiting through the production 120-second cap.
+						departedAt := time.Now().Add(-tcpMaximumRTO + 500*time.Millisecond)
+						waiter.departedAt.Store(int64(monotonicStampAt(stack.timestampEpoch, departedAt)))
+						wire := buildTestTCP(remote, local, 80, 12345, 200, 101, TCPFlagACK, 0, nil, nil)
+						if err := writeTestPacket(stack, wire); err != nil {
+							t.Fatal(err)
+						}
+					})
+					_ = c.Info()
+					if probes := stack.Stats().TCPZeroWindowProbes; probes != tcpMaximumRTOs {
+						t.Fatalf("current ACK after departure published probe immediately: %d", probes)
+					}
+					time.Sleep(100 * time.Millisecond)
+					if probes := stack.Stats().TCPZeroWindowProbes; probes != tcpMaximumRTOs {
+						t.Fatalf("current ACK after departure shortened deadline: %d", probes)
+					}
+					waitFor(t, time.Second, func() bool { return stack.Stats().TCPZeroWindowProbes == tcpMaximumRTOs+1 })
+					if info := c.Info(); info.State != TCPStateEstablished {
+						t.Fatalf("current ACK after departure changed state: %+v", info)
+					}
+					return
+				case "current ACK":
+					deliver(101, 0)
+					if info := c.Info(); info.State != TCPStateEstablished || stack.Stats().TCPZeroWindowProbes != tcpMaximumRTOs {
+						t.Fatalf("current ACK did not retain the next probe interval: %+v", info)
+					}
+					withActorPaused(func() {
+						if actorTimer.active {
+							t.Fatal("current ACK armed persist timer before probe departure")
+						}
+						if _, departed := waiter.departedTime(stack.timestampEpoch); departed {
+							t.Fatal("terminal probe departed before the explicit queue read")
+						}
+					})
+					// The ACK can arrive while the terminal probe is still in the
+					// device queue. It must not discard the departure waiter and
+					// re-use the queue-admission deadline.
+					withActorPaused(func() {
+						buffers, sizes := [][]byte{make([]byte, 1500)}, make([]int, 1)
+						if n, err := stack.Read(buffers, sizes, 0); err != nil || n != 1 {
+							t.Fatalf("Stack.Read = %d, %v", n, err)
+						}
+						if _, departed := waiter.departedTime(stack.timestampEpoch); !departed {
+							t.Fatal("current ACK discarded the terminal departure waiter")
+						}
+					})
+					firePersist()
+					waitFor(t, time.Second, func() bool { return stack.Stats().TCPZeroWindowProbes == tcpMaximumRTOs+1 })
+					if info := c.Info(); info.State != TCPStateEstablished {
+						t.Fatalf("current ACK did not cancel the terminal wait: %+v", info)
+					}
+					return
+				case "old ACK", "future ACK", "stale Timestamp":
+					if scenario == "old ACK" {
+						deliver(100, 0)
+					} else if scenario == "future ACK" {
+						deliver(102, 0)
+					} else {
+						wire := buildTestTCP(remote, local, 80, 12345, 200, 101, TCPFlagACK, 0, tcpTimestampOptions(100, 0), nil)
+						if err := writeTestPacket(stack, wire); err != nil {
+							t.Fatal(err)
+						}
+						_ = c.Info()
+						_ = c.Info()
+					}
+					withActorPaused(func() {
+						if actorTimer.active || stack.Stats().TCPZeroWindowProbes != tcpMaximumRTOs {
+							t.Fatal("unaccepted or old ACK canceled the terminal departure wait")
+						}
+					})
+					return
+				case "window reopen":
+					deliver(101, 65535)
+					waitFor(t, time.Second, func() bool { return c.Info().BytesSent == 1+uint64(len("queued")) })
+					if info := c.Info(); info.State != TCPStateEstablished || info.PeerWindow == 0 || stack.Stats().TCPZeroWindowProbes != tcpMaximumRTOs {
+						t.Fatalf("window reopening did not replace persist: %+v", info)
+					}
+					return
+				case "full Close":
+					if err := c.Close(); err != nil {
+						t.Fatal(err)
+					}
+					firePersist()
+					waitFor(t, time.Second, func() bool { return stack.Stats().TCPZeroWindowProbes == tcpMaximumRTOs+1 })
+					for count := uint64(tcpMaximumRTOs + 1); count < 2*tcpMaximumRTOs; count++ {
+						deliver(101, 0)
+						firePersist()
+						waitFor(t, time.Second, func() bool { return stack.Stats().TCPZeroWindowProbes == count+1 })
+					}
+					deliver(101, 0)
+					firePersist()
+				case "user timeout":
+					if err := c.SetUserTimeout(100 * time.Millisecond); err != nil {
+						t.Fatal(err)
+					}
+				}
+				select {
+				case <-c.done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("persist actor did not apply its terminal deadline")
+				}
+				var wantError error = os.ErrDeadlineExceeded
+				if scenario == "user timeout" {
+					wantError = syscall.ETIMEDOUT
+				}
+				if info := c.Info(); !errors.Is(info.LastError, wantError) {
+					t.Fatalf("persist terminal error = %v, want %v", info.LastError, wantError)
+				}
+			})
+		}
+	}
+}
+
+// TestTCPPersistResponsivePeerKeepsZeroWindow exercises more published probes
+// than the unanswered budget permits, with a current ACK after each probe.
+func TestTCPPersistResponsivePeerKeepsZeroWindow(t *testing.T) {
+	local, remote := netip.MustParseAddr("192.0.2.195"), netip.MustParseAddr("198.51.100.195")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	c := newTCPConn(stack, "tcp4", tcpKey{local: netip.AddrPortFrom(local, 12345), remote: netip.AddrPortFrom(remote, 80)}, 1500, tcpSocketOptionSet{})
+	c.sendBuffer.append([]byte("queued"))
+	state := newTCPEstablishedState(c, 100)
+	defer state.finish()
+	state.persistClosed = 9
+	for i := 0; i < 2*tcpMaximumRTOs; i++ {
+		// Select the real publisher's due state without waiting through the
+		// protocol's exponential backoff in this accounting test.
+		state.persist = true
+		state.sendTimer.baseDeadline = time.Time{}
+		if waiter, err := state.drainPersistOutput(tcpOutputReservation{}); waiter != nil || err != nil {
+			t.Fatalf("probe %d = %v, %v", i, waiter, err)
+		}
+		_ = readOutboundPacket(t, stack)
+		segment := tcpSegment{acknowledgement: 100, flags: TCPFlagACK, window: 0}
+		state.processAcknowledgment(&segment, time.Now(), 0)
+		if state.persistUnanswered != 0 || state.persistClosed != 9 || !state.persist || state.peerWindow != 0 || state.sendNext != 100 {
+			t.Fatalf("response %d changed persist state: %+v", i, state.sendTimer)
+		}
+	}
+	if got := stack.Stats().TCPZeroWindowProbes; got != 2*tcpMaximumRTOs {
+		t.Fatalf("probes = %d", got)
+	}
+	state.peerWindow = 65535
+	state.armPersist(time.Time{}, len("queued"), false)
+	if state.persist || !state.sendTimer.baseDeadline.IsZero() || state.persistClosed != 0 || state.sendTimer.persistHostQueueToken != 0 {
+		t.Fatalf("window reopening retained persist state: %+v", state.sendTimer)
+	}
+}
+
+func TestTCPPersistCapacityDoesNotConsumeBudgets(t *testing.T) {
+	local, remote := netip.MustParseAddr("192.0.2.193"), netip.MustParseAddr("198.51.100.193")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	c := newTCPConn(stack, "tcp4", tcpKey{local: netip.AddrPortFrom(local, 12345), remote: netip.AddrPortFrom(remote, 80)}, 1500, tcpSocketOptionSet{})
+	c.userClosed = true
+	c.sendBuffer.append([]byte("queued"))
+	state := newTCPEstablishedState(c, 100)
+	defer state.finish()
+	state.persist = true
+	state.persistUnanswered, state.persistClosed = 14, 14
+	before := state.sendTimer
+	var held []uint16
+	for {
+		slot, ok := stack.outbound.tryReserve()
+		if !ok {
+			break
+		}
+		held = append(held, slot)
+	}
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for i := 0; i < 20; i++ {
+		if waiter, err := state.drainPersistOutput(tcpOutputReservation{}); waiter != nil || err != nil || state.sendTimer != before || state.persistUnanswered != 14 || state.persistClosed != 14 {
+			t.Fatalf("capacity retry = %v, %v, %+v", waiter, err, state.sendTimer)
+		}
+	}
+	if stack.Stats().TCPZeroWindowProbes != 0 {
+		t.Fatal("capacity shortage counted a probe")
+	}
+}
+
 func TestTCPPersistProbeSurvivesStoppedDeviceRead(t *testing.T) {
 	for _, test := range []struct {
 		name         string
@@ -8689,18 +9260,19 @@ func TestTCPSendTimerOwnership(t *testing.T) {
 		now := time.Now()
 		persistDeadline := now.Add(10 * time.Second)
 		state := tcpEstablishedState{
-			connection:  &TCPConn{stack: &Stack{timestampEpoch: now}},
-			outstanding: []sentTCPSegment{{}},
-			rtt:         rttEstimator{rto: time.Second},
-			persist:     true,
-			sendTimer:   tcpSendTimerState{baseDeadline: persistDeadline, persistRTO: 2 * time.Second, persistAttempts: 3},
+			connection:        &TCPConn{stack: &Stack{timestampEpoch: now}},
+			outstanding:       []sentTCPSegment{{}},
+			rtt:               rttEstimator{rto: time.Second},
+			persist:           true,
+			sendTimer:         tcpSendTimerState{baseDeadline: persistDeadline, persistRTO: 2 * time.Second},
+			persistUnanswered: 3, persistClosed: 3,
 		}
 		state.updateRetransmissionTimer(tcpRetransmissionReselect, now)
 		if state.persist || !state.retransmit || state.sendTimer.baseDeadline.Equal(persistDeadline) {
 			t.Fatalf("send timer after new flight = persist:%v retransmit:%v deadline:%v", state.persist, state.retransmit, state.sendTimer.baseDeadline)
 		}
-		if state.sendTimer.persistRTO != time.Second || state.sendTimer.persistAttempts != 0 {
-			t.Fatalf("persist backoff after new flight = RTO:%v attempts:%d", state.sendTimer.persistRTO, state.sendTimer.persistAttempts)
+		if state.sendTimer.persistRTO != time.Second || state.persistUnanswered != 0 || state.persistClosed != 0 {
+			t.Fatalf("persist backoff after new flight = %+v", state.sendTimer)
 		}
 	})
 	t.Run("SACK reneging grace is not restarted", func(t *testing.T) {
@@ -9241,6 +9813,8 @@ func TestTCPConnectionMemoryLayout(t *testing.T) {
 	}{
 		{"TCPConn", unsafe.Sizeof(TCPConn{}), 688},
 		{"socketDeadline", unsafe.Sizeof(socketDeadline{}), 16},
+		// BenchmarkTCPEstablishedStateAllocation measures the effective heap
+		// cost, including any runtime header, separately from this layout check.
 		{"tcpEstablishedState", unsafe.Sizeof(tcpEstablishedState{}), 1520},
 		{"tcpRACKSample", unsafe.Sizeof(tcpRACKSample{}), 48},
 		{"tcpEstablishedLivenessState", unsafe.Sizeof(tcpEstablishedLivenessState{}), 72},
