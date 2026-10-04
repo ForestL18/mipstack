@@ -350,14 +350,14 @@ func (b *bbr3CongestionControl) handlePacingEvent(event *CongestionEvent) {
 
 // onRateSample advances the path model and returns updated cwnd and ssthresh.
 func (b *bbr3CongestionControl) onRateSample(window uint32, mss int, sample *tcpDeliveryRateSample) (uint32, uint32) {
-	packet := bbr3DecodePacketState(sample.packetState)
-	if packet.inflight == 0 {
-		packet.inflight = sample.priorInFlight
-	}
 	rate := b.updateBandwidth(sample)
 	b.updateLatestDeliverySignals(sample, rate)
 	b.updateCongestionSignals(sample, rate, window)
 	b.updateACKAggregation(sample, window, mss)
+	// Like Linux BBRv3's rate_sample, probe loss requires a selected
+	// transmission's tx.in_flight and tx.lost. Current flight cannot fill
+	// a missing snapshot: that would charge historical losses to this probe.
+	packet := bbr3DecodePacketState(sample.packetState)
 	b.checkStartupLoss(sample, packet, mss)
 	b.checkFullBandwidth(sample, rate)
 	threshold := b.checkDrain(sample, mss)

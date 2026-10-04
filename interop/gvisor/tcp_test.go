@@ -282,6 +282,152 @@ func TestTCPReadWithBufferInterop(t *testing.T) {
 	}
 }
 
+// TestTCPOldACKTimestampInterop sends native gVisor data with a reordered
+// cumulative ACK and a newer timestamp. The application receives the stream,
+// mipstack echoes the new timestamp, and gVisor completes the half-close.
+func TestTCPOldACKTimestampInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		t.Run(family.name, func(t *testing.T) {
+			var armed, translated atomic.Bool
+			var expectedEcho, expectedACK atomic.Uint32
+			echoed := make(chan uint32, 1)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					segment, size, ok := tcpSegment(packet)
+					if !ok || !armed.Load() || segment.Flags().Contains(header.TCPFlagSyn) {
+						return true
+					}
+					if size != 0 {
+						segment.SetAckNumber(segment.AckNumber() - 1)
+						expectedACK.Store(segment.SequenceNumber() + uint32(size))
+					}
+					if !rewriteTCPTimestamps(packet, func(value, echo uint32) (uint32, uint32) {
+						if size != 0 {
+							expectedEcho.Store(value + 1000)
+						}
+						return value + 1000, echo
+					}) {
+						return false
+					}
+					translated.Store(true)
+					return true
+				},
+				mipstackToGVisor: func(packet []byte) bool {
+					segment, size, ok := tcpSegment(packet)
+					if !ok || !translated.Load() || segment.Flags().Contains(header.TCPFlagSyn) {
+						return true
+					}
+					if size == 0 && segment.AckNumber() == expectedACK.Load() {
+						select {
+						case echoed <- segment.ParsedOptions().TSEcr:
+						default:
+						}
+					}
+					return rewriteTCPTimestamps(packet, func(value, echo uint32) (uint32, uint32) { return value, echo - 1000 })
+				},
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client, server, listener := openTCPPair(t, ctx, network, family, false)
+			defer listener.Close()
+			defer client.Close()
+			defer server.Close()
+			exchangeTCPPayload(t, client, server, []byte("seed"))
+			connection := client.(*mipstack.TCPConn)
+			deadline := time.Now().Add(5 * time.Second)
+			for connection.Info().BytesInFlight != 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("seed was not cumulatively acknowledged")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			armed.Store(true)
+			exchangeTCPPayload(t, server, client, []byte("old ACK timestamp"))
+			select {
+			case echo := <-echoed:
+				if want := expectedEcho.Load(); echo != want {
+					t.Fatalf("old ACK timestamp echo = %d, want %d", echo, want)
+				}
+			case <-ctx.Done():
+				t.Fatal("mipstack did not acknowledge native gVisor data")
+			}
+			if err := server.(*gonet.TCPConn).CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			var data [1]byte
+			if n, err := client.Read(data[:]); n != 0 || !errors.Is(err, io.EOF) {
+				t.Fatalf("native gVisor half-close = %d, %v, want EOF", n, err)
+			}
+		})
+	}
+}
+
+// TestTCPOldACKSACKRecoveryInterop reorders native gVisor SACK feedback after
+// dropping one mipstack data range. Every byte must reach the gVisor socket
+// through selective recovery, rather than waiting for a cumulative-ACK RTO.
+func TestTCPOldACKSACKRecoveryInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		for _, algorithm := range []string{mipstack.CongestionControlReno, mipstack.CongestionControlCUBIC, mipstack.CongestionControlBBR, mipstack.CongestionControlBBR3} {
+			t.Run(family.name+"/"+algorithm, func(t *testing.T) {
+				var armed, dropped atomic.Bool
+				var gap, rewritten atomic.Uint32
+				network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+					families: []interopFamily{family}, mtu: 1500,
+					tcp: mipstack.TCPSocketDefaults{CongestionControl: algorithm},
+					mipstackToGVisor: func(packet []byte) bool {
+						segment, size, ok := tcpSegment(packet)
+						if ok && size != 0 && armed.Load() && dropped.CompareAndSwap(false, true) {
+							gap.Store(segment.SequenceNumber())
+							return false
+						}
+						return true
+					},
+					gvisorToMipstack: func(packet []byte) bool {
+						segment, _, ok := tcpSegment(packet)
+						if !ok || !dropped.Load() || segment.AckNumber() != gap.Load() || !tcpHasSACKOption(segment) {
+							return true
+						}
+						segment.SetAckNumber(segment.AckNumber() - 1)
+						segment.SetChecksum(0)
+						partial := header.PseudoHeaderChecksum(tcp.ProtocolNumber, gvisorAddress(family.gvisorAddress), gvisorAddress(family.mipstackAddress), uint16(len(segment)))
+						segment.SetChecksum(^checksum.Checksum(segment, partial))
+						rewritten.Add(1)
+						return true
+					},
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				client, server, listener := openTCPPair(t, ctx, network, family, false)
+				defer listener.Close()
+				defer client.Close()
+				defer server.Close()
+				exchangeTCPPayload(t, client, server, []byte("seed"))
+				connection := client.(*mipstack.TCPConn)
+				deadline := time.Now().Add(5 * time.Second)
+				for connection.Info().BytesInFlight != 0 {
+					if time.Now().After(deadline) {
+						t.Fatal("seed was not cumulatively acknowledged")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				before := network.mipstack.Stats()
+				armed.Store(true)
+				exchangeTCPPayload(t, client, server, patternedPayload(128*1024, 71))
+				stats := network.mipstack.Stats()
+				retransmissions := stats.TCPRetransmissions - before.TCPRetransmissions
+				selective := stats.TCPSACKRetransmissions - before.TCPSACKRetransmissions
+				// The link loses only this data range. Total retransmissions must
+				// all be selective; an RTO or retransmitted TLP cannot make a
+				// delayed but otherwise successful socket transfer pass.
+				if !dropped.Load() || rewritten.Load() == 0 || selective == 0 || retransmissions != selective {
+					t.Fatalf("old ACK selective recovery = dropped %t rewritten %d total retransmissions %d SACK retransmissions %d RACK retransmissions %d", dropped.Load(), rewritten.Load(), retransmissions, selective, stats.TCPRACKRetransmissions-before.TCPRACKRetransmissions)
+				}
+			})
+		}
+	}
+}
+
 // TestTCPMissingTimestampInterop verifies that a real gVisor-to-mipstack
 // packet path still completes streams when an in-path device removes the
 // negotiated Timestamp option from non-SYN segments. The hook delivers the

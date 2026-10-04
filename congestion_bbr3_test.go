@@ -235,6 +235,33 @@ func TestBBR3ACKLossRateUsesTransmissionSnapshot(t *testing.T) {
 	}
 }
 
+func TestBBR3ACKWithoutDeliveryDoesNotInventProbeLoss(t *testing.T) {
+	const mss = 1000
+	now := time.Unix(100, 0)
+	for _, hasSnapshot := range []bool{false, true} {
+		bbr := newBBR3CongestionControl()
+		bbr.mode, bbr.probePhase = bbrProbeBandwidth, bbr3ProbeUp
+		bbr.fullBandwidthReached, bbr.probeSamples = true, true
+		bbr.minimumRTT, bbr.minimumRTTStamp = 10*time.Millisecond, now
+		bbr.bandwidthHigh[1], bbr.probeStarted = 1_000_000, now
+		bbr.lost = 1000
+		sample := tcpDeliveryRateSample{ackTime: now, priorInFlight: 20_000, inFlight: 20_000, smoothedRTT: 10 * time.Millisecond}
+		if hasSnapshot {
+			// A valid transmission can have tx.lost=0 even when its rate
+			// interval is unusable. Its actual loss proof must still apply.
+			sample.packetState = bbr3EncodePacketState(&CongestionState{BytesInFlight: 19_000}, mss)
+		}
+		_, _ = bbr.onRateSample(20_000, mss, &sample)
+		if hasSnapshot {
+			if bbr.probeSamples || bbr.probePhase != bbr3ProbeDown || bbr.inflightHigh == 0 {
+				t.Fatalf("real transmission loss was ignored: %+v", bbr)
+			}
+		} else if !bbr.probeSamples || bbr.probePhase != bbr3ProbeUp || bbr.inflightHigh != 0 {
+			t.Fatalf("ACK without a transmission snapshot invented probe loss: %+v", bbr)
+		}
+	}
+}
+
 func TestBBR3LossRoundAdvancesIndependently(t *testing.T) {
 	bbr := newBBR3CongestionControl()
 	bbr.lossRoundDelivered = 100

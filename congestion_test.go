@@ -30,13 +30,36 @@ func TestBuiltInCongestionControllerLayouts(t *testing.T) {
 	}{
 		{"Reno", unsafe.Sizeof(renoCongestionControl{}), 16},
 		{"CUBIC", unsafe.Sizeof(cubicCongestionControl{}), 256},
-		{"BBR", unsafe.Sizeof(bbrCongestionControl{}), 360},
+		{"BBR", unsafe.Sizeof(bbrCongestionControl{}), 384},
 		{"BBRv3", unsafe.Sizeof(bbr3CongestionControl{}), 400},
 	}
 	for _, test := range tests {
 		if test.got != test.want {
 			t.Errorf("%s controller size = %d, want %d; reassess the lossy-connection allocation class", test.name, test.got, test.want)
 		}
+	}
+}
+
+var benchmarkCreatedCongestionController CongestionController
+
+// BenchmarkCongestionControllerAllocation measures the heap allocation class,
+// rather than assuming that every change in raw struct size saves heap memory.
+func BenchmarkCongestionControllerAllocation(b *testing.B) {
+	for _, test := range []struct {
+		name string
+		new  func() CongestionController
+	}{
+		{name: CongestionControlReno, new: func() CongestionController { return newRenoCongestionControl() }},
+		{name: CongestionControlCUBIC, new: func() CongestionController { return newCUBICCongestionControl() }},
+		{name: CongestionControlBBR, new: func() CongestionController { return newBBRCongestionControl() }},
+		{name: CongestionControlBBR3, new: func() CongestionController { return newBBR3CongestionControl() }},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for iteration := 0; iteration < b.N; iteration++ {
+				benchmarkCreatedCongestionController = test.new()
+			}
+		})
 	}
 }
 

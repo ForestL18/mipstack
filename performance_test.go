@@ -213,7 +213,7 @@ func BenchmarkTCPControllerLatency(b *testing.B) {
 	}
 }
 
-func benchmarkTCPControllerConnections(b *testing.B, algorithm string, count int) []net.Conn {
+func benchmarkTCPControllerConnections(b *testing.B, algorithm string, count int) ([]net.Conn, []net.Conn) {
 	b.Helper()
 	clientAddress := netip.MustParseAddr("192.0.2.211")
 	serverAddress := netip.MustParseAddr("192.0.2.212")
@@ -302,7 +302,7 @@ func benchmarkTCPControllerConnections(b *testing.B, algorithm string, count int
 		<-bridge.done
 		<-bridge.done
 	})
-	return connections
+	return connections, serverConnections
 }
 
 func BenchmarkTCPControllerConcurrency(b *testing.B) {
@@ -310,7 +310,7 @@ func BenchmarkTCPControllerConcurrency(b *testing.B) {
 	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		for _, count := range []int{16, 64, 256, 512, 1024, 2048, 4096, 8192} {
 			b.Run(fmt.Sprintf("%s-%d", algorithm, count), func(b *testing.B) {
-				connections := benchmarkTCPControllerConnections(b, algorithm, count)
+				connections, peerConnections := benchmarkTCPControllerConnections(b, algorithm, count)
 				payload := bytes.Repeat([]byte{0x6b}, size)
 				b.SetBytes(int64(2 * size * count))
 				b.ResetTimer()
@@ -341,6 +341,43 @@ func BenchmarkTCPControllerConcurrency(b *testing.B) {
 						}
 					}
 				}
+				b.StopTimer()
+				var retransmissions, queueDrops, window, sendCapacity uint64
+				for _, connection := range connections {
+					info := connection.(*TCPConn).Info()
+					retransmissions += info.Retransmissions
+					queueDrops += info.InboundQueueDrops
+					window += uint64(info.CongestionWindow)
+					sendCapacity += uint64(info.SendBufferCapacity)
+				}
+				var peerRetransmissions, peerQueueDrops, peerWindow, peerSendCapacity uint64
+				for _, connection := range peerConnections {
+					info := connection.(*TCPConn).Info()
+					peerRetransmissions += info.Retransmissions
+					peerQueueDrops += info.InboundQueueDrops
+					peerWindow += uint64(info.CongestionWindow)
+					peerSendCapacity += uint64(info.SendBufferCapacity)
+				}
+				stats := connections[0].(*TCPConn).stack.Stats()
+				peerStats := peerConnections[0].(*TCPConn).stack.Stats()
+				b.ReportMetric(float64(retransmissions), "retransmissions")
+				b.ReportMetric(float64(queueDrops), "connection-queue-drops")
+				b.ReportMetric(float64(window)/float64(count), "cwnd-B/flow")
+				b.ReportMetric(float64(sendCapacity)/float64(count), "send-buffer-B/flow")
+				b.ReportMetric(float64(stats.TCPTailLossProbes), "tail-loss-probes")
+				b.ReportMetric(float64(stats.TCPSACKRetransmissions), "sack-retransmissions")
+				b.ReportMetric(float64(stats.TCPRACKRetransmissions), "rack-retransmissions")
+				b.ReportMetric(float64(stats.InboundDroppedPackets), "rx-drops")
+				b.ReportMetric(float64(stats.TCPInboundQueueDrops), "queue-drops")
+				b.ReportMetric(float64(peerRetransmissions), "peer-retransmissions")
+				b.ReportMetric(float64(peerQueueDrops), "peer-connection-queue-drops")
+				b.ReportMetric(float64(peerWindow)/float64(count), "peer-cwnd-B/flow")
+				b.ReportMetric(float64(peerSendCapacity)/float64(count), "peer-send-buffer-B/flow")
+				b.ReportMetric(float64(peerStats.TCPTailLossProbes), "peer-tail-loss-probes")
+				b.ReportMetric(float64(peerStats.TCPSACKRetransmissions), "peer-sack-retransmissions")
+				b.ReportMetric(float64(peerStats.TCPRACKRetransmissions), "peer-rack-retransmissions")
+				b.ReportMetric(float64(peerStats.InboundDroppedPackets), "peer-rx-drops")
+				b.ReportMetric(float64(peerStats.TCPInboundQueueDrops), "peer-queue-drops")
 			})
 		}
 	}

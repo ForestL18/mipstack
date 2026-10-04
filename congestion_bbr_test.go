@@ -199,16 +199,52 @@ func TestBBRProbeBandwidthUsesDeliveryClock(t *testing.T) {
 
 func TestBBRLongTermPolicerDetection(t *testing.T) {
 	start := time.Unix(100, 0)
-	bbr := bbrCongestionControl{delivered: 1000, totalLost: 300}
+	bbr := bbrCongestionControl{delivered: 1000, totalLost: 300, deliveredAt: start}
 	bbr.updateLongTermBandwidth(bbrSample(tcpDeliveryRateSample{losses: 300, ackTime: start}))
 	for interval := 1; interval <= 2; interval++ {
 		bbr.longTermRounds = bbrLongTermMinimumRounds
 		bbr.delivered += 10_000
 		bbr.totalLost += 3000
+		bbr.deliveredAt = start.Add(time.Duration(interval) * time.Second)
 		bbr.updateLongTermBandwidth(bbrSample(tcpDeliveryRateSample{losses: 3000, ackTime: start.Add(time.Duration(interval) * time.Second)}))
 	}
 	if !bbr.longTermUseBandwidth || bbr.longTermBandwidth != 10_000 {
 		t.Fatalf("policer model = use %t rate %v", bbr.longTermUseBandwidth, bbr.longTermBandwidth)
+	}
+}
+
+func TestBBRPolicerClockFollowsDeliveryEvents(t *testing.T) {
+	start := time.Unix(100, 0)
+	for _, interval := range []time.Duration{time.Second, 2 * time.Hour} {
+		bbr := newBBRCongestionControl()
+		state := CongestionState{CongestionWindow: 20_000, MaximumSegmentSize: 1000, DeliveredBytes: 1000}
+		bbr.HandleCongestionEvent(&CongestionEvent{Type: CongestionEventInitialize, Time: start, State: &state})
+		state.LostBytes = 300
+		bbr.HandleCongestionEvent(&CongestionEvent{Type: CongestionEventTimeout, Time: start.Add(time.Second), State: &state})
+		if !bbr.longTermLastStamp.Equal(start) {
+			t.Fatalf("timeout before first ACK moved delivery boundary to %v, want %v", bbr.longTermLastStamp, start)
+		}
+		state.DeliveredBytes += 10_000
+		state.LostBytes += 3000
+		deliveredAt := start.Add(interval)
+		sample := tcpDeliveryRateSample{acked: 10_000, ackTime: deliveredAt}
+		bbr.HandleCongestionEvent(&CongestionEvent{Type: CongestionEventACK, Time: deliveredAt, State: &state, RateSample: &sample})
+		sample = tcpDeliveryRateSample{ackTime: deliveredAt.Add(time.Second)}
+		bbr.HandleCongestionEvent(&CongestionEvent{Type: CongestionEventACK, Time: sample.ackTime, State: &state, RateSample: &sample})
+		if !bbr.deliveredAt.Equal(deliveredAt) {
+			t.Fatalf("zero-delivery ACK moved clock to %v, want %v", bbr.deliveredAt, deliveredAt)
+		}
+		// Isolate the interval calculation after sufficient packet rounds.
+		bbr.longTermRounds = bbrLongTermMinimumRounds
+		bbr.HandleCongestionEvent(&CongestionEvent{Type: CongestionEventTimeout, Time: deliveredAt.Add(10 * time.Second), State: &state})
+		if want := 10_000 / interval.Seconds(); bbr.longTermBandwidth != want || !bbr.longTermLastStamp.Equal(deliveredAt) {
+			t.Fatalf("policer interval %v = rate %f stamp %v, want %f and %v", interval, bbr.longTermBandwidth, bbr.longTermLastStamp, want, deliveredAt)
+		}
+		restart := deliveredAt.Add(20 * time.Second)
+		bbr.HandleCongestionEvent(&CongestionEvent{Type: CongestionEventPacketSent, Time: restart, State: &state, PacketBytes: 1000, OutstandingBytes: 0})
+		if !bbr.deliveredAt.Equal(restart) {
+			t.Fatalf("empty-flight restart = %v, want %v", bbr.deliveredAt, restart)
+		}
 	}
 }
 
@@ -843,7 +879,7 @@ func TestBBRSpuriousRecoveryUndoRetainsDeliveryAccounting(t *testing.T) {
 	controller.delivery.delivered = 1000
 	controller.syncDeliveryState()
 	var undo tcpRecoveryUndo
-	undo.begin(false, 2000, 20_000, 20_000, 10_000, &controller, rttEstimator{})
+	undo.begin(false, 2000, 20_000, 20_000, 10_000, &controller, rttEstimator{}, time.Unix(100, 0))
 	controller.delivery.delivered = 5000
 	controller.syncDeliveryState()
 	bbrState(t, &controller).delivered = 5000

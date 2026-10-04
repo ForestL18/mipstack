@@ -280,7 +280,9 @@ fragmentation state, and resets the receiver for reuse. `Reset` explicitly
 abandons an incomplete packet. The type deliberately has no clock, goroutine,
 global capacity policy, or `Close`: callers multiplexing many datagrams remain
 responsible for their identity table, lifetime, and aggregate resource limits.
-`Stack` supplies that surrounding policy for live network traffic.
+`Stack` supplies that surrounding policy for live network traffic. ECN merging
+preserves CE and, like Linux, retains the offset-zero ECT codepoint for a mixed
+ECT(0)/ECT(1) datagram without CE; mixtures with Not-ECT are rejected.
 
 `IPPacket.UpperLayer` structurally walks IPv6 Hop-by-Hop, Destination Options,
 Routing, atomic Fragment, Authentication, and Mobility headers. ESP and
@@ -999,8 +1001,10 @@ Validated network- and host-unreachable feedback for `SND.UNA` applies RFC
 connection's soft network error into a hard failure.
 On a SACK-negotiated connection, only newly reported scoreboard information
 counts toward RFC 6675 `DupAcks`; repeated cumulative ACKs and window-probe
-responses without new SACK data cannot manufacture a loss episode. The receive
-path preserves three prompt duplicate ACKs and then applies Linux-style bounded
+responses without new SACK data cannot manufacture a loss episode. An accepted
+reordered ACK can refresh TS.Recent and report SACK/DSACK without changing the
+send window or restarting the cumulative-ACK RTO. The receive path preserves
+three prompt duplicate ACKs and then applies Linux-style bounded
 SACK compression; the sender gives apparent SACK reneging a short grace period
 before clearing contradictory scoreboard state and entering timeout recovery.
 Initial Reno and CUBIC slow start use RFC 9406 HyStart++ and Conservative Slow

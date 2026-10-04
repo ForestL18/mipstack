@@ -19,6 +19,8 @@ The suite covers:
   established-connection resets, keepalive restart after bidirectional data,
   receive-window closure and reopening, SYN, SYN-ACK, final-ACK, FIN, and data
   retransmission after deterministic loss or reordering;
+- Reordered cumulative ACKs refreshing Timestamp echoes and carrying native
+  gVisor SACK feedback for selective recovery in both address families;
 - Reno, CUBIC, BBR, and BBRv3 mipstack senders recovering from loss against
   both active and passive gVisor connections, plus an unregistered local
   congestion-control factory receiving correct IPv4/IPv6 connection context;
@@ -29,7 +31,7 @@ The suite covers:
   against gVisor and delivered to its native sockets, and bidirectional ICMP
   Port Unreachable delivery;
 - UDP fragmentation and reassembly in both directions, including reordered
-  and duplicate IPv4 and IPv6 fragments;
+  and duplicate IPv4 and IPv6 fragments and mixed ECT(0)/ECT(1) codepoints;
 - bidirectional UDP and raw-IP ancillary data for destination address, TTL or
   Hop Limit, TOS or Traffic Class, and emitted IPv6 Flow Label;
 - creation-time TCP, UDP, and raw-IP socket policies in both address families,
