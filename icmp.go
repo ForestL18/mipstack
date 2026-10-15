@@ -1545,8 +1545,7 @@ func quotedIPPayload(packet []byte) (netip.Addr, netip.Addr, byte, []byte, bool)
 			}
 			switch next {
 			case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderRouting,
-				IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderAuthentication,
-				IPv6ExtensionHeaderMobility:
+				IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderAuthentication:
 				length, valid := ipv6ExtensionHeaderLength(next, payload[offset:])
 				if !valid {
 					return netip.Addr{}, netip.Addr{}, 0, nil, false
@@ -1565,6 +1564,9 @@ func quotedIPPayload(packet []byte) (netip.Addr, netip.Addr, byte, []byte, bool)
 					return netip.Addr{}, netip.Addr{}, 0, nil, false
 				}
 			default:
+				// RFC 6275 identifies Mobility messages as protocol 135, even
+				// with Payload Proto 59. Like Linux raw ICMPv6 error lookup,
+				// preserve that protocol rather than following it as an extension.
 				return source, target, next, payload[offset:], true
 			}
 		}

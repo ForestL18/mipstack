@@ -135,6 +135,7 @@ func BenchmarkTCPControllerThroughput(b *testing.B) {
 					b.Fatal("echo payload mismatch")
 				}
 			}
+			b.StopTimer()
 			if tcp, ok := connection.(*TCPConn); ok {
 				info := tcp.Info()
 				stats := tcp.stack.Stats()
@@ -152,6 +153,7 @@ func BenchmarkTCPControllerThroughput(b *testing.B) {
 				b.ReportMetric(float64(stats.TCPInboundQueueDrops), "queue-drops")
 				b.ReportMetric(float64(peerStats.InboundDroppedPackets), "peer-rx-drops")
 				b.ReportMetric(float64(peerStats.TCPInboundQueueDrops), "peer-queue-drops")
+				b.ReportMetric(float64(stats.OutboundPackets+peerStats.OutboundPackets)/float64(b.N), "wire-packets/op")
 				b.ReportMetric(float64(stats.TCPSACKRetransmissions), "sack-retransmissions")
 				b.ReportMetric(float64(stats.TCPRACKRetransmissions), "rack-retransmissions")
 				b.ReportMetric(float64(stats.TCPTailLossProbes), "tail-loss-probes")
@@ -221,6 +223,10 @@ func BenchmarkTCPControllerFixedBufferThroughput(b *testing.B) {
 					b.Fatalf("fixed socket buffers changed: %+v", info)
 				}
 			}
+			clientStats, peerStats := sender.stack.Stats(), peer.Stats()
+			b.ReportMetric(float64(clientStats.OutboundPackets+peerStats.OutboundPackets)/float64(b.N), "wire-packets/op")
+			b.ReportMetric(float64(sender.inbound.peakBytes()), "client-inbound-queue-peak-B")
+			b.ReportMetric(float64(receiver.inbound.peakBytes()), "peer-inbound-queue-peak-B")
 			b.ReportMetric(float64(sender.Info().Retransmissions+receiver.Info().Retransmissions), "retransmissions")
 		})
 	}

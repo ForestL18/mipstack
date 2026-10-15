@@ -17060,3 +17060,527 @@ func TestTCPOutstandingSmallFlightReuse(t *testing.T) {
 		t.Fatalf("expanded outstanding length/capacity = %d/%d", len(state.outstanding), cap(state.outstanding))
 	}
 }
+
+func TestTCPEmptyIOSocketState(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		prepare  func(*TCPConn) error
+		readErr  error
+		writeErr error
+	}{
+		{name: "open"},
+		{name: "read deadline", prepare: func(c *TCPConn) error { return c.SetReadDeadline(time.Now().Add(-time.Second)) }},
+		{name: "write deadline", prepare: func(c *TCPConn) error { return c.SetWriteDeadline(time.Now().Add(-time.Second)) }, writeErr: os.ErrDeadlineExceeded},
+		{name: "CloseRead", prepare: (*TCPConn).CloseRead},
+		{name: "CloseWrite", prepare: (*TCPConn).CloseWrite, writeErr: net.ErrClosed},
+		{name: "Close", prepare: (*TCPConn).Close, readErr: net.ErrClosed, writeErr: net.ErrClosed},
+		{name: "peer reset", prepare: func(c *TCPConn) error { c.finish(syscall.ECONNRESET); return nil }, writeErr: syscall.ECONNRESET},
+		{name: "local abort", prepare: func(c *TCPConn) error {
+			c.abort(net.ErrClosed)
+			c.finish(net.ErrClosed)
+			return nil
+		}, readErr: net.ErrClosed, writeErr: net.ErrClosed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, buffer := range [][]byte{nil, make([]byte, 0)} {
+				connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				connection.stack = &Stack{closeCh: make(chan struct{})}
+				t.Cleanup(func() { _ = connection.Close() })
+				if test.prepare != nil {
+					if err := test.prepare(connection); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for _, operation := range []struct {
+					name string
+					call func([]byte) (int, error)
+					want error
+				}{{"read", connection.Read, test.readErr}, {"write", connection.Write, test.writeErr}} {
+					n, err := operation.call(buffer)
+					if n != 0 || !errors.Is(err, operation.want) {
+						t.Fatalf("empty %s = %d, %v, want %v", operation.name, n, err, operation.want)
+					}
+					if err != nil {
+						var opError *net.OpError
+						if !errors.As(err, &opError) || opError.Op != operation.name {
+							t.Fatalf("empty %s lost its operation wrapper: %v", operation.name, err)
+						}
+					}
+				}
+				if connection.sendBuffer.size != 0 || connection.actorWakeFlags.Load() != 0 && test.prepare == nil {
+					t.Fatal("empty write queued output")
+				}
+			}
+		})
+	}
+}
+
+func TestTCPEmptyReadPreservesReceiveState(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	connection.stack = &Stack{closeCh: make(chan struct{})}
+	defer connection.Close()
+	payload := []byte("queued")
+	if n := connection.appendReadBuffer(payload, payload, 0, 0); n != len(payload) {
+		t.Fatalf("queued %d of %d bytes", n, len(payload))
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	connection.finish(syscall.ECONNRESET)
+	for _, buffer := range [][]byte{nil, make([]byte, 0)} {
+		if n, err := connection.Read(buffer); n != 0 || err != nil {
+			t.Fatalf("empty Read with buffered data, reset, and expired deadline = %d, %v", n, err)
+		}
+	}
+	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, len(payload))
+	if n, err := connection.Read(buffer); n != len(payload) || err != nil || !bytes.Equal(buffer, payload) {
+		t.Fatalf("queued data after empty Read = %q, %d, %v", buffer, n, err)
+	}
+	if n, err := connection.Read(buffer); n != 0 || !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("pending reset after empty Read = %d, %v", n, err)
+	}
+}
+
+func TestTCPResetReleasesUnusedReadTimer(t *testing.T) {
+	link, _, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+	if err := connection.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	link.mu.Lock()
+	peer := link.tcp[connection.key.local.Port()]
+	sequence, acknowledgement := peer.serverNext, peer.clientNext
+	link.mu.Unlock()
+	if err := link.deliverTCP(connection.key.remote.Port(), connection.key.local.Port(), sequence, acknowledgement, TCPFlagRST, 0, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-connection.done:
+	case <-time.After(time.Second):
+		t.Fatal("RST did not terminate the protocol actor")
+	}
+	connection.mu.Lock()
+	armed := connection.readDeadline.timer != nil
+	connection.mu.Unlock()
+	if armed {
+		t.Fatal("empty terminal receive queue retained a read timer")
+	}
+	if n, err := connection.Read(make([]byte, 1)); n != 0 || !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("empty receive queue after reset = %d, %v", n, err)
+	}
+}
+
+func TestTCPResetPreservesReadDeadline(t *testing.T) {
+	for _, mode := range []string{"Read", "ReadWithBuffer", "WriteTo"} {
+		t.Run(mode, func(t *testing.T) {
+			link, _, connection := newManuallyPumpedTCPConnection(t)
+			defer connection.Close()
+			if err := connection.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			connection.mu.Lock()
+			expired := connection.readDeadline.channelLocked()
+			connection.mu.Unlock()
+			link.mu.Lock()
+			peer := link.tcp[connection.key.local.Port()]
+			sequence, acknowledgement := peer.serverNext, peer.clientNext
+			link.mu.Unlock()
+			payload := []byte("queued")
+			if err := link.deliverTCP(connection.key.remote.Port(), connection.key.local.Port(), sequence, acknowledgement, TCPFlagACK, 65535, nil, payload); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, time.Second, func() bool {
+				connection.mu.Lock()
+				defer connection.mu.Unlock()
+				return connection.readBuffer.size == len(payload)
+			})
+			if err := link.deliverTCP(connection.key.remote.Port(), connection.key.local.Port(), sequence+uint32(len(payload)), acknowledgement, TCPFlagRST, 0, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-connection.done:
+			case <-time.After(time.Second):
+				t.Fatal("RST did not terminate the protocol actor")
+			}
+			select {
+			case <-expired:
+			case <-time.After(time.Second):
+				t.Fatal("protocol termination canceled the application read deadline")
+			}
+			buffer := make([]byte, len(payload))
+			var writer bytes.Buffer
+			callbackCalls := 0
+			read := func() (int64, error) {
+				switch mode {
+				case "Read":
+					n, err := connection.Read(buffer)
+					return int64(n), err
+				case "ReadWithBuffer":
+					n, err := connection.ReadWithBuffer(func(sizeHint int) []byte {
+						callbackCalls++
+						if sizeHint != len(payload) {
+							t.Errorf("size hint = %d, want %d", sizeHint, len(payload))
+						}
+						return buffer
+					})
+					return int64(n), err
+				default:
+					return connection.WriteTo(&writer)
+				}
+			}
+			if n, err := read(); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) || callbackCalls != 0 || writer.Len() != 0 {
+				t.Fatalf("read after reset and deadline = %d, %v, callback calls %d, output %d", n, err, callbackCalls, writer.Len())
+			}
+			if err := connection.SetWriteDeadline(time.Time{}); err != nil {
+				t.Fatalf("SetWriteDeadline after peer reset: %v", err)
+			}
+			if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatalf("SetReadDeadline after peer reset: %v", err)
+			}
+			if err := connection.SetDeadline(time.Time{}); err != nil {
+				t.Fatalf("SetDeadline after peer reset: %v", err)
+			}
+			n, err := read()
+			if mode == "WriteTo" {
+				buffer = writer.Bytes()
+				if !errors.Is(err, syscall.ECONNRESET) {
+					t.Fatalf("WriteTo terminal error = %v, want ECONNRESET", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if n != int64(len(payload)) || !bytes.Equal(buffer, payload) {
+				t.Fatalf("buffered data after reset = %q, %d", buffer, n)
+			}
+			if n, err := connection.Read(buffer); n != 0 || !errors.Is(err, syscall.ECONNRESET) {
+				t.Fatalf("drained reset Read = %d, %v", n, err)
+			}
+			if n, err := connection.Read(nil); n != 0 || err != nil {
+				t.Fatalf("empty Read after peer reset = %d, %v", n, err)
+			}
+			if n, err := connection.Write([]byte{1}); n != 0 || !errors.Is(err, syscall.ECONNRESET) {
+				t.Fatalf("Write after peer reset = %d, %v", n, err)
+			}
+		})
+	}
+}
+
+func TestTCPFirstUnsackedSegment(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		segments []sentTCPSegment
+		want     int
+	}{
+		{name: "empty", want: -1},
+		{name: "unsacked", segments: []sentTCPSegment{{}}, want: 0},
+		{name: "all-SACKed", segments: []sentTCPSegment{{state: sentTCPSegmentSACKed}, {state: sentTCPSegmentSACKed}}, want: 0},
+		{name: "hole", segments: []sentTCPSegment{{state: sentTCPSegmentSACKed}, {}, {state: sentTCPSegmentSACKed}}, want: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := firstUnsackedSegment(test.segments); got != test.want {
+				t.Fatalf("first unsacked = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestTCPFRTOAfterCongestionControlChange(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		for _, phase := range []tcpFRTOState{tcpFRTOTimeoutPending, tcpFRTOAwaitingACK, tcpFRTOProbePending, tcpFRTOProbeSent, tcpFRTOFallbackPending} {
+			for _, partial := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/phase-%d/partial-%t", algorithm, phase, partial), func(t *testing.T) {
+					start := time.Now()
+					connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+					connection.stack = &Stack{timestampEpoch: start}
+					state := tcpEstablishedState{
+						connection: connection, controller: newTCPCongestionController(CongestionControlCUBIC),
+						peerMSS: 1000, peerWindow: 20000, sendUnacknowledged: 2000, sendNext: 6000,
+						congestionWindow: 1000, slowStartThreshold: 4000, rtt: newRTTEstimator(20 * time.Millisecond),
+						rtoRecovery: true, rtoRecoveryPoint: 4000, frtoState: phase,
+						outstanding: []sentTCPSegment{{sequence: 2000, end: 3000}, {sequence: 3000, end: 4000}, {sequence: 4000, end: 5000}, {sequence: 5000, end: 6000}},
+						undo:        &tcpRecoveryUndo{},
+					}
+					state.controller.initialize(start, time.Millisecond, time.Millisecond, 8000, 16000, 1000, monotonicStampAt(start, start))
+					state.undo.begin(true, 4000, 8000, 16000, 4000, &state.controller, state.rtt, start)
+					state.undo.recordRetransmission(1000, 2000, 1, false)
+					if phase == tcpFRTOProbePending {
+						state.frtoProbeBudget = 1
+					}
+					registered, _ := registeredCongestionControlFactory(algorithm)
+					definition := registered.definition
+					definition.Name = "test-frto-replacement-" + algorithm
+					factory, err := NewCongestionControlFactory(definition)
+					if err != nil {
+						t.Fatal(err)
+					}
+					state.changeCongestionController(factory, 0)
+					defer state.controller.release(time.Now(), state.congestionWindow, state.slowStartThreshold, state.congestionFlight(), state.peerMSS, state.rtt.srtt, state.rtt.minimum)
+					if state.undo.active {
+						t.Fatal("controller replacement retained its predecessor's undo snapshot")
+					}
+					if partial {
+						segment := tcpSegment{acknowledgement: 3000, flags: TCPFlagACK, window: 20000}
+						update := state.processAcknowledgment(&segment, start.Add(time.Millisecond), 0)
+						state.updateRetransmissionTimer(update, start.Add(time.Millisecond))
+						if state.sendUnacknowledged != 3000 || len(state.outstanding) != 3 || !state.retransmit {
+							t.Fatalf("partial ACK lost remaining flight: %+v", state)
+						}
+						if phase == tcpFRTOTimeoutPending || phase == tcpFRTOProbePending || phase == tcpFRTOProbeSent {
+							if state.frtoState != tcpFRTOInactive || state.rtoRecovery || state.rtoRecoveryPoint != 0 || state.recoveryOutputPending() || state.recoveryOutputReady() {
+								t.Fatalf("spurious partial ACK still authorized RTO output: F-RTO %d RTO %t point %d", state.frtoState, state.rtoRecovery, state.rtoRecoveryPoint)
+							}
+							if state.controller.state.Phase != CongestionPhaseOpen || state.congestionWindow == 8000 || state.slowStartThreshold != 4000 {
+								t.Fatalf("spurious partial ACK restored an unavailable congestion checkpoint: phase %v cwnd %d threshold %d", state.controller.state.Phase, state.congestionWindow, state.slowStartThreshold)
+							}
+						}
+					}
+					segment := tcpSegment{acknowledgement: 6000, flags: TCPFlagACK, window: 20000}
+					update := state.processAcknowledgment(&segment, start.Add(2*time.Millisecond), 0)
+					state.updateRetransmissionTimer(update, start.Add(2*time.Millisecond))
+					if len(state.outstanding) != 0 || state.frtoState != tcpFRTOInactive || state.frtoProbeBudget != 0 || state.rtoRecovery || state.retransmit || state.controller.state.Phase != CongestionPhaseOpen {
+						t.Fatalf("full ACK did not finish recovery: F-RTO %d budget %d RTO %t timer %t phase %v outstanding %d", state.frtoState, state.frtoProbeBudget, state.rtoRecovery, state.retransmit, state.controller.state.Phase, len(state.outstanding))
+					}
+					if state.undo.spuriousUndos != 0 || connection.stack.stats.tcpSpuriousRecoveryUndos.Load() != 0 {
+						t.Fatal("unavailable undo was counted as a successful restoration")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestTCPFRTOSACKAfterCongestionControlChange(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		for _, phase := range []tcpFRTOState{tcpFRTOProbePending, tcpFRTOProbeSent} {
+			for _, rackLoss := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/phase-%d/RACK-loss-%t", algorithm, phase, rackLoss), func(t *testing.T) {
+					start := time.Now()
+					connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+					connection.stack = &Stack{timestampEpoch: start}
+					state := tcpEstablishedState{
+						connection: connection, controller: newTCPCongestionController(CongestionControlCUBIC),
+						peerMSS: 1000, peerSACK: true, peerWindow: 20000,
+						sendUnacknowledged: 2000, sendNext: 5000, bytesAcknowledged: 1000,
+						congestionWindow: 1000, slowStartThreshold: 4000, rtt: newRTTEstimator(20 * time.Millisecond),
+						rtoRecovery: true, rtoRecoveryPoint: 4000, frtoState: phase,
+						rackReorderingSeen: true,
+						outstanding: []sentTCPSegment{
+							{sequence: 2000, end: 3000, state: sentTCPSegmentTransmitted, firstSent: time.Millisecond, hostQueue: packetQueueTicket{queuedAt: monotonicStampAt(start, start.Add(time.Millisecond))}},
+							{sequence: 3000, end: 4000, state: sentTCPSegmentTransmitted, firstSent: 2 * time.Millisecond, hostQueue: packetQueueTicket{queuedAt: monotonicStampAt(start, start.Add(2*time.Millisecond))}},
+							{sequence: 4000, end: 5000, state: sentTCPSegmentTransmitted, firstSent: 60 * time.Millisecond, hostQueue: packetQueueTicket{queuedAt: monotonicStampAt(start, start.Add(60*time.Millisecond))}},
+						},
+						undo: &tcpRecoveryUndo{},
+						// A selective ACK can change loss selection, but must not
+						// restart the cumulative-ACK-based RTO deadline.
+						sendTimer:  tcpSendTimerState{baseDeadline: start.Add(time.Second)},
+						retransmit: true, retransmissionDeadline: start.Add(time.Second),
+					}
+					if phase == tcpFRTOProbePending {
+						state.frtoProbeBudget = 1
+					}
+					if rackLoss {
+						state.outstanding[0].state.set(sentTCPSegmentRACKLost, true)
+						state.haveRACKLoss = true
+					}
+					state.controller.initialize(start, time.Millisecond, time.Millisecond, 8000, 16000, 1000, monotonicStampAt(start, start))
+					state.undo.begin(true, 4000, 8000, 16000, 4000, &state.controller, state.rtt, start)
+					state.undo.recordRetransmission(1000, 2000, 1, false)
+					registered, _ := registeredCongestionControlFactory(algorithm)
+					definition := registered.definition
+					definition.Name = "test-frto-sack-replacement-" + algorithm
+					factory, err := NewCongestionControlFactory(definition)
+					if err != nil {
+						t.Fatal(err)
+					}
+					state.changeCongestionController(factory, 0)
+					defer func() {
+						state.controller.release(time.Now(), state.congestionWindow, state.slowStartThreshold, state.congestionFlight(), state.peerMSS, state.rtt.srtt, state.rtt.minimum)
+					}()
+					if state.undo.active {
+						t.Fatal("controller replacement retained its predecessor's undo snapshot")
+					}
+					segment := tcpSegment{acknowledgement: 2000, flags: TCPFlagACK, window: 20000}
+					segment.setOptions(testSACKOptions(map[uint32][]byte{3000: make([]byte, 1000)}))
+					update := state.processAcknowledgment(&segment, start.Add(80*time.Millisecond), 0)
+					state.updateRetransmissionTimer(update, start.Add(80*time.Millisecond))
+					if state.sendUnacknowledged != 2000 || state.bytesAcknowledged != 1000 || len(state.outstanding) != 3 || state.sackedRanges != 1 || state.sackedBytes != 1000 || !state.outstanding[1].state.has(sentTCPSegmentSACKed) {
+						t.Fatalf("selective delivery changed cumulative ACK or lost flight: UNA %d bytes %d flight %d SACK %d/%d", state.sendUnacknowledged, state.bytesAcknowledged, len(state.outstanding), state.sackedRanges, state.sackedBytes)
+					}
+					if state.frtoState != tcpFRTOInactive || state.frtoProbeBudget != 0 || state.rtoRecovery || state.rtoRecoveryPoint != 0 {
+						t.Fatalf("selective delivery retained F-RTO authorization: phase %d budget %d RTO %t point %d", state.frtoState, state.frtoProbeBudget, state.rtoRecovery, state.rtoRecoveryPoint)
+					}
+					if !state.retransmit || !state.sendTimer.baseDeadline.Equal(start.Add(time.Second)) {
+						t.Fatal("selective delivery canceled or restarted the remaining flight's RTO")
+					}
+					if rackLoss {
+						if !state.outstanding[0].state.has(sentTCPSegmentRACKLost) || !state.haveRACKLoss || !state.fastRecovery || !state.recoveryOutputPending() {
+							t.Fatal("F-RTO completion discarded independent RACK recovery")
+						}
+					} else if state.fastRecovery || state.haveRACKLoss || state.controller.state.Phase != CongestionPhaseOpen || state.recoveryOutputPending() || state.recoveryOutputReady() {
+						t.Fatal("selective delivery without loss retained immediate recovery output")
+					}
+					if connection.stack.stats.tcpSpuriousRecoveryUndos.Load() != 0 || state.undo.spuriousUndos != 0 {
+						t.Fatal("unavailable undo was counted as a successful restoration")
+					}
+					segment = tcpSegment{acknowledgement: 5000, flags: TCPFlagACK, window: 20000}
+					update = state.processAcknowledgment(&segment, start.Add(81*time.Millisecond), 0)
+					state.updateRetransmissionTimer(update, start.Add(81*time.Millisecond))
+					if len(state.outstanding) != 0 || state.retransmit || state.fastRecovery || state.rtoRecovery || state.recoveryOutputPending() {
+						t.Fatal("full ACK did not release the remaining flight and recovery output")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestTCPFRTOProbeACKAfterCongestionControlChange(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.251"), netip.MustParseAddr("192.0.2.252"))
+	link.mu.Lock()
+	link.echoTCP, link.disableTCPSACK = true, true
+	link.mu.Unlock()
+	dialed, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8080))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := dialed.(*TCPConn)
+	defer connection.Close()
+	if err = connection.SetCongestionControl(CongestionControlReno); err != nil {
+		t.Fatal(err)
+	}
+	before := connection.Info()
+	if before.SACK {
+		t.Fatal("wire regression requires non-SACK F-RTO")
+	}
+	link.mu.Lock()
+	peer := link.tcp[connection.key.local.Port()]
+	sequence, serverSequence := peer.clientNext, peer.serverNext
+	link.echoTCP = false
+	link.mu.Unlock()
+	payload := bytes.Repeat([]byte{0x93}, 20*before.MaximumSegmentSize)
+	if n, writeErr := connection.Write(payload); n != len(payload) || writeErr != nil {
+		t.Fatalf("Write = %d, %v", n, writeErr)
+	}
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	initialEnd := sequence
+	retransmitted := false
+	for !retransmitted {
+		select {
+		case wire := <-link.outbound:
+			packet, parseErr := ParseIPPacket(wire)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			segment, parseErr := packet.TCPSegment()
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			if len(segment.Payload) == 0 {
+				continue
+			}
+			if segment.SequenceNumber == sequence && initialEnd != sequence {
+				retransmitted = connection.Info().RetransmissionRecovery
+			} else if end := segment.SequenceNumber + uint32(len(segment.Payload)); tcpSequenceGreater(end, initialEnd) {
+				initialEnd = end
+			}
+		case <-deadline.C:
+			t.Fatal("initial flight did not enter RTO recovery")
+		}
+	}
+	if initialEnd >= sequence+uint32(len(payload)) {
+		t.Fatal("initial flight left no new data for F-RTO probes")
+	}
+	if err = link.deliverTCP(8080, connection.key.local.Port(), serverSequence, sequence+uint32(before.MaximumSegmentSize), TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	probeEnd := initialEnd
+	for probes := 0; probes < 2; {
+		select {
+		case wire := <-link.outbound:
+			packet, parseErr := ParseIPPacket(wire)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			segment, parseErr := packet.TCPSegment()
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			if len(segment.Payload) != 0 && tcpSequenceGreaterEqual(segment.SequenceNumber, initialEnd) {
+				if segment.SequenceNumber != probeEnd {
+					t.Fatalf("F-RTO probe sequence = %d, want %d", segment.SequenceNumber, probeEnd)
+				}
+				probeEnd += uint32(len(segment.Payload))
+				probes++
+			}
+		case <-deadline.C:
+			t.Fatal("F-RTO did not publish two new probes")
+		}
+	}
+	if err = connection.SetCongestionControl(CongestionControlCUBIC); err != nil {
+		t.Fatal(err)
+	}
+	if info := connection.Info(); info.CongestionControl != CongestionControlCUBIC || !info.RetransmissionRecovery {
+		t.Fatalf("controller switch during F-RTO = %+v", info)
+	}
+	partialACK := sequence + 2*uint32(before.MaximumSegmentSize)
+	if err = link.deliverTCP(8080, connection.key.local.Port(), serverSequence, partialACK, TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return connection.Info().BytesAcknowledged-before.BytesAcknowledged == uint64(partialACK-sequence)
+	})
+	if info := connection.Info(); info.RetransmissionRecovery {
+		t.Fatalf("spurious partial ACK retained RTO recovery: %+v", info)
+	}
+	if err = link.deliverTCP(8080, connection.key.local.Port(), serverSequence, probeEnd, TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return connection.Info().BytesAcknowledged-before.BytesAcknowledged == uint64(probeEnd-sequence)
+	})
+	info := connection.Info()
+	if info.State != TCPStateEstablished || info.RetransmissionRecovery || info.SpuriousRecoveryUndos != before.SpuriousRecoveryUndos {
+		t.Fatalf("legal probe ACK after controller replacement = %+v", info)
+	}
+	select {
+	case <-connection.done:
+		t.Fatal("legal probe ACK terminated the TCP actor")
+	default:
+	}
+}
+
+func BenchmarkTCPApplicationWrite(b *testing.B) {
+	for _, size := range []int{0, 64, 1200, 32 * 1024} {
+		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
+			connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			payload := bytes.Repeat([]byte{0x5a}, size)
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if n, err := connection.Write(payload); n != size || err != nil {
+					b.Fatalf("Write = %d, %v", n, err)
+				}
+				if connection.sendBuffer.size != size {
+					b.Fatalf("send buffer size = %d, want %d", connection.sendBuffer.size, size)
+				}
+				connection.sendBuffer.acknowledge(size)
+			}
+		})
+	}
+}
+
+func BenchmarkTCPEmptyRead(b *testing.B) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if n, err := connection.Read(nil); n != 0 || err != nil {
+			b.Fatalf("Read = %d, %v", n, err)
+		}
+	}
+}

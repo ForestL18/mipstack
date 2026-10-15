@@ -3698,8 +3698,19 @@ func (s *tcpEstablishedState) restoreRecoveryTransportState(acknowledged uint32)
 // after Eifel, DSACK, or F-RTO proves that a congestion response was spurious.
 // RFC 4015's follow-up RTO estimator response applies to any detected spurious
 // timeout; tcpRecoveryUndo returns no response for fast-retransmit recovery.
+// Without a usable checkpoint, it ends F-RTO without restoring the old window.
 func (s *tcpEstablishedState) restoreSpuriousRecovery(receivedAt time.Time, acknowledged uint32) bool {
 	if s.undo == nil || !s.undo.active {
+		if s.frtoState != tcpFRTOInactive {
+			// RFC 5682 section 4 ends retransmission based on a proven
+			// spurious timeout even when its congestion response cannot be undone.
+			s.frtoState = tcpFRTOInactive
+			s.frtoProbeBudget = 0
+			s.rtoRecovery = false
+			s.rtoRecoveryPoint = 0
+			s.sackRenegingRecovery = false
+			s.controller.setCongestionPhase(CongestionPhaseOpen, receivedAt)
+		}
 		return false
 	}
 	flight := s.ordinaryFlight()
@@ -5711,6 +5722,14 @@ func (c *TCPConn) acceptsICMPQuote(quoted []byte) bool {
 // Read returns contiguous application bytes or the receive terminal state.
 func (c *TCPConn) Read(buffer []byte) (int, error) {
 	if len(buffer) == 0 {
+		// Go net on Linux checks local closure before returning from an
+		// empty Read, without receiving data or checking the read deadline.
+		c.mu.Lock()
+		closed := c.locallyClosedLocked()
+		c.mu.Unlock()
+		if closed {
+			return 0, c.operationError("read", net.ErrClosed)
+		}
 		return 0, nil
 	}
 	c.readCallMu.Lock()
@@ -5896,11 +5915,9 @@ func (c *TCPConn) Write(payload []byte) (int, error) {
 // write copies payload into the send buffer without adding the public
 // operation wrapper. The caller serializes it with other stream writes.
 func (c *TCPConn) write(payload []byte) (int, error) {
-	if len(payload) == 0 {
-		return 0, nil
-	}
 	written := 0
-	for written < len(payload) {
+	// Like Go net on Linux, even an empty Write checks state and deadline.
+	for {
 		c.mu.Lock()
 		if c.userClosed || c.writeClosed || c.terminalErr != nil {
 			c.sendBuffer.limited = false
@@ -5957,7 +5974,6 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 			return written, err
 		}
 	}
-	return written, nil
 }
 
 // ReadFrom copies a stream into c while preserving write ordering with
@@ -6235,9 +6251,13 @@ func (c *TCPConn) setOperationError(err error) error {
 // SetDeadline updates both application deadlines.
 func (c *TCPConn) SetDeadline(deadline time.Time) error {
 	c.mu.Lock()
+	// Like Go net on Linux, peer termination does not close the application's
+	// descriptor or disable deadlines for its remaining buffered data.
 	if c.userClosed || c.terminalErr != nil {
-		c.mu.Unlock()
-		return c.setOperationError(net.ErrClosed)
+		if c.locallyClosedLocked() {
+			c.mu.Unlock()
+			return c.setOperationError(net.ErrClosed)
+		}
 	}
 	c.readDeadline.setLocked(deadline)
 	c.writeDeadline.setLocked(deadline)
@@ -6249,8 +6269,10 @@ func (c *TCPConn) SetDeadline(deadline time.Time) error {
 func (c *TCPConn) SetReadDeadline(deadline time.Time) error {
 	c.mu.Lock()
 	if c.userClosed || c.terminalErr != nil {
-		c.mu.Unlock()
-		return c.setOperationError(net.ErrClosed)
+		if c.locallyClosedLocked() {
+			c.mu.Unlock()
+			return c.setOperationError(net.ErrClosed)
+		}
 	}
 	c.readDeadline.setLocked(deadline)
 	c.mu.Unlock()
@@ -6261,8 +6283,10 @@ func (c *TCPConn) SetReadDeadline(deadline time.Time) error {
 func (c *TCPConn) SetWriteDeadline(deadline time.Time) error {
 	c.mu.Lock()
 	if c.userClosed || c.terminalErr != nil {
-		c.mu.Unlock()
-		return c.setOperationError(net.ErrClosed)
+		if c.locallyClosedLocked() {
+			c.mu.Unlock()
+			return c.setOperationError(net.ErrClosed)
+		}
 	}
 	c.writeDeadline.setLocked(deadline)
 	c.mu.Unlock()
@@ -6623,6 +6647,22 @@ func (c *TCPConn) connectionErrorLocked() error {
 	return net.ErrClosed
 }
 
+// locallyClosedLocked distinguishes application closure or local cancellation
+// from peer protocol termination. The caller holds c.mu.
+func (c *TCPConn) locallyClosedLocked() bool {
+	if c.userClosed {
+		return true
+	}
+	if c.terminalErr != nil {
+		select {
+		case <-c.abortCh:
+			return true
+		default:
+		}
+	}
+	return false
+}
+
 // notifyReadLocked wakes the serialized application reader. Repeated state
 // changes coalesce while it is running.
 func (c *TCPConn) notifyReadLocked() {
@@ -6829,7 +6869,11 @@ func (c *TCPConn) finish(err error) {
 	}
 	c.mu.Lock()
 	c.terminalErr = err
-	c.readDeadline.stopLocked()
+	// Go net on Linux keeps buffered data after peer reset subject to the
+	// read deadline. Local closure or an empty terminal queue needs no timer.
+	if discardReceive || c.userClosed || c.readClosed || c.readBuffer.size == 0 {
+		c.readDeadline.stopLocked()
+	}
 	c.writeDeadline.stopLocked()
 	if discardReceive {
 		c.readBuffer = tcpReadBuffer{}
@@ -7988,23 +8032,8 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		}
 		switch {
 		case spurious:
-			pendingTimeout := state.frtoState == tcpFRTOTimeoutPending
-			if state.restoreSpuriousRecovery(receivedAt, acknowledgedForUndo) {
-				rtoPartialACK = false
-			} else if pendingTimeout {
-				// A controller change may deliberately discard the undo snapshot.
-				// The advancing ACK still cancels output that never reached the wire,
-				// but the reduced congestion window cannot be reconstructed.
-				state.frtoState = tcpFRTOInactive
-				state.frtoProbeBudget = 0
-				if tcpSequenceGreaterEqual(ack, state.rtoRecoveryPoint) {
-					state.rtoRecovery = false
-					state.rtoRecoveryPoint = 0
-					state.sackRenegingRecovery = false
-					state.controller.setCongestionPhase(CongestionPhaseOpen, receivedAt)
-					rtoPartialACK = false
-				}
-			}
+			rtoPartialACK = false
+			state.restoreSpuriousRecovery(receivedAt, acknowledgedForUndo)
 		case fallback:
 			state.frtoState = tcpFRTOInactive
 			state.frtoProbeBudget = 0
@@ -11032,14 +11061,17 @@ func splitTCPSegmentAt(outstanding []sentTCPSegment, boundary uint32) []sentTCPS
 
 // firstUnsackedSegment returns the oldest known hole, falling back to the
 // first segment when every segment is selectively acknowledged and the
-// cumulative ACK may have been lost.
+// cumulative ACK may have been lost. An empty flight returns -1.
 func firstUnsackedSegment(outstanding []sentTCPSegment) int {
 	for index := range outstanding {
 		if !outstanding[index].state.has(sentTCPSegmentSACKed) {
 			return index
 		}
 	}
-	return 0
+	if len(outstanding) != 0 {
+		return 0
+	}
+	return -1
 }
 
 // lastUnsackedSegment returns the newest segment eligible for a tail-loss

@@ -5943,3 +5943,77 @@ func TestUDPForwarderListenCreationOptionsValidateBeforeClaim(t *testing.T) {
 		t.Fatalf("forwarded UDP listener creation policy = %+v", info)
 	}
 }
+
+func TestTCPForwarderRevalidatesSYNAdmission(t *testing.T) {
+	for _, ipv6 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("IPv6-%t", ipv6), func(t *testing.T) {
+			local, remote, intercepted := netip.MustParseAddr("192.0.2.247"), netip.MustParseAddr("192.0.2.248"), netip.MustParseAddr("198.51.100.247")
+			if ipv6 {
+				local, remote, intercepted = netip.MustParseAddr("2001:db8::247"), netip.MustParseAddr("2001:db8::248"), netip.MustParseAddr("2001:db8:1::247")
+			}
+			stack := newForwarderTestStack(t, local, true)
+			requests := make(chan *TCPForwarderRequest, 2)
+			forwarder, err := NewTCPForwarder(stack, TCPForwarderOptions{MaxInFlight: 1}, func(request *TCPForwarderRequest) {
+				requests <- request
+				<-request.Done()
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			key := tcpKey{local: netip.AddrPortFrom(intercepted, 8080), remote: netip.AddrPortFrom(remote, 5300)}
+			segment := tcpSegment{flags: TCPFlagSYN, sequence: 1000}
+			previous := stack.network.Load()
+			if !previous.acceptsInboundDestination(intercepted) {
+				t.Fatal("original network policy did not admit intercepted destination")
+			}
+			if handled, admitted := forwarder.admitSegment(segment, key); !handled || !admitted {
+				t.Fatal("initial request was not admitted")
+			}
+			var first *TCPForwarderRequest
+			select {
+			case first = <-requests:
+			case <-time.After(time.Second):
+				t.Fatal("initial handler did not start")
+			}
+			if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())}, MTU: 1400}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-first.Done():
+			default:
+				t.Fatal("configuration update retained an invalid pending request")
+			}
+			// A dispatcher can retain this old policy until after UpdateConfig's
+			// request scan. Admission must use the newly published policy.
+			if !previous.acceptsInboundDestination(intercepted) {
+				t.Fatal("immutable policy snapshot changed")
+			}
+			if handled, admitted := forwarder.admitSegment(segment, key); !handled || admitted {
+				t.Fatalf("stale SYN admission = handled %t, admitted %t", handled, admitted)
+			}
+			if forwarder.handleTimeWaitSegment(segment, key) {
+				t.Fatal("rejected SYN was allowed to replace its TIME-WAIT owner")
+			}
+			if info := forwarder.Info(); info.Pending != 0 || info.Requests != 1 {
+				t.Fatalf("invalid SYN consumed request capacity: %+v", info)
+			}
+			key.local = netip.AddrPortFrom(local, 8080)
+			wire := buildTestTCP(remote, local, key.remote.Port(), key.local.Port(), segment.sequence, 0, TCPFlagSYN, 65535, nil, nil)
+			if err = writeTestPacket(stack, wire); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case request := <-requests:
+				if request.Flow().Destination != key.local {
+					t.Fatalf("accepted destination = %v, want %v", request.Flow().Destination, key.local)
+				}
+				if err = request.Drop(); err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("valid SYN could not use the released capacity")
+			}
+		})
+	}
+}

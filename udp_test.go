@@ -2659,3 +2659,89 @@ func TestUDPImpairedLinkLatencyAndLoss(t *testing.T) {
 		t.Fatal("UDP jitter did not exercise packet reordering")
 	}
 }
+
+func TestUDPWriteRejectsOutOfRangePorts(t *testing.T) {
+	for _, network := range []string{"udp4", "udp6"} {
+		t.Run(network, func(t *testing.T) {
+			local, remote := netip.MustParseAddr("192.0.2.245"), netip.MustParseAddr("192.0.2.246")
+			if network == "udp6" {
+				local, remote = netip.MustParseAddr("2001:db8::245"), netip.MustParseAddr("2001:db8::246")
+			}
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			listened, err := stack.ListenUDP(context.Background(), network, netip.AddrPortFrom(local, 5300))
+			if err != nil {
+				t.Fatal(err)
+			}
+			connection := listened.(*UDPConn)
+			defer connection.Close()
+			payload := []byte("port")
+			for _, method := range []string{"WriteTo", "WriteToUDP", "WriteMsgUDP", "WriteBatch"} {
+				for _, port := range []int{-1, 65536, 65537, 70000, int(^uint(0) >> 1)} {
+					address := net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 1))
+					address.Port = port
+					pending := &net.OpError{Op: "read", Err: syscall.ECONNREFUSED}
+					connection.mu.Lock()
+					connection.errorState = &datagramSocketErrorState{pending: pending}
+					connection.mu.Unlock()
+					var n int
+					var writeErr error
+					switch method {
+					case "WriteTo":
+						n, writeErr = connection.WriteTo(payload, address)
+					case "WriteToUDP":
+						n, writeErr = connection.WriteToUDP(payload, address)
+					case "WriteMsgUDP":
+						// An invalid port must precede both a pending error and
+						// malformed ancillary data.
+						n, _, writeErr = connection.WriteMsgUDP(payload, []byte{1}, address)
+					case "WriteBatch":
+						n, writeErr = connection.WriteBatch([]SocketMessage{{Buffers: [][]byte{payload}, OOB: []byte{1}, Addr: address}}, 0)
+					}
+					var operation *net.OpError
+					if n != 0 || !errors.Is(writeErr, syscall.EINVAL) || !errors.As(writeErr, &operation) || operation.Op != "write" || operation.Addr != address {
+						t.Fatalf("%s port %d = %d, %v", method, port, n, writeErr)
+					}
+					connection.mu.Lock()
+					remaining := connection.errorState.pending
+					connection.errorState.pending = nil
+					connection.mu.Unlock()
+					if remaining != pending || stack.outbound.len() != 0 {
+						t.Fatalf("%s port %d consumed pending error or emitted output", method, port)
+					}
+				}
+			}
+			for _, port := range []uint16{0, 1, 65535} {
+				address := net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, port))
+				if n, writeErr := connection.WriteToUDP(payload, address); n != len(payload) || writeErr != nil {
+					t.Fatalf("valid port %d = %d, %v", port, n, writeErr)
+				}
+				packet, parseErr := ParseIPPacket(readOutboundPacket(t, stack))
+				if parseErr != nil {
+					t.Fatal(parseErr)
+				}
+				datagram, parseErr := packet.UDPDatagram()
+				if parseErr != nil || datagram.Destination.Port() != port || !bytes.Equal(datagram.Payload, payload) {
+					t.Fatalf("port %d output = %+v, %v", port, datagram, parseErr)
+				}
+			}
+			valid := net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 1))
+			invalid := net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 2))
+			invalid.Port = 65538
+			messages := []SocketMessage{{Buffers: [][]byte{payload}, Addr: valid}, {Buffers: [][]byte{payload}, Addr: invalid}, {Buffers: [][]byte{payload}, Addr: valid}}
+			if n, writeErr := connection.WriteBatch(messages, 0); n != 1 || writeErr != nil || messages[0].N != len(payload) {
+				t.Fatalf("batch prefix = %d, %v, messages %+v", n, writeErr, messages)
+			}
+			_ = readOutboundPacket(t, stack)
+			if n, writeErr := connection.WriteBatch(messages[1:], 0); n != 0 || !errors.Is(writeErr, syscall.EINVAL) || stack.outbound.len() != 0 {
+				t.Fatalf("batch retry = %d, %v", n, writeErr)
+			}
+		})
+	}
+}

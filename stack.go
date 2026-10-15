@@ -4211,12 +4211,13 @@ func (d *socketDeadline) waitLocked() <-chan struct{} {
 	return d.done
 }
 
-// stopLocked releases an armed timer while the owner mutex is held because its
-// socket can no longer perform I/O. A callback that has already started may
-// still close its private channel.
+// stopLocked releases an armed timer while the owner mutex is held. A running
+// callback must close its generation before that channel can be reused.
 func (d *socketDeadline) stopLocked() {
 	if d.timer != nil {
-		d.timer.Stop()
+		if !d.timer.Stop() {
+			<-d.done
+		}
 		d.timer = nil
 	}
 }

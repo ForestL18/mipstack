@@ -980,6 +980,16 @@ func (c *UDPConn) readBatchMessage(message *SocketMessage, flags int, wait, cons
 
 // Read receives the next datagram from a connected remote endpoint.
 func (c *UDPConn) Read(buffer []byte) (int, error) {
+	// Go net on Linux treats an empty Read as a local-closure check, not
+	// a datagram receive. Address and message reads still consume a packet.
+	if len(buffer) == 0 {
+		select {
+		case <-c.closed:
+			return 0, c.operationError("read", c.remoteAddr(), net.ErrClosed)
+		default:
+		}
+		return 0, nil
+	}
 	n, _, _, _, _, err := c.readDatagram(buffer, nil)
 	if err != nil {
 		return n, c.operationError("read", c.remoteAddr(), err)
@@ -996,8 +1006,7 @@ func (c *UDPConn) Read(buffer []byte) (int, error) {
 // payload length as an advisory size hint. It runs without c's connection state
 // lock and must return promptly; it must not call a read method on c. The caller
 // owns the returned slice, and c does not retain it. A nil callback returns
-// EINVAL. A short returned slice truncates and consumes the datagram, matching
-// Read.
+// EINVAL. A short or empty returned slice truncates and consumes the datagram.
 //
 // This is an experimental API and is not covered by the package's stability
 // guarantees.
@@ -1118,8 +1127,9 @@ func (c *UDPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, pee
 		if ok {
 			if !peek {
 				c.queuedBytes -= udpDatagramSize(datagram.payload)
-				c.notifyReceiveLocked()
 			}
+			// Linux MSG_PEEK preserves readability for other waiting readers.
+			c.notifyReceiveLocked()
 			n = copyMessagePayload(buffers, datagram.payload)
 			truncated = n < len(datagram.payload)
 			if truncated && returnLength {
@@ -1224,6 +1234,9 @@ func (c *UDPConn) WriteToUDP(payload []byte, address *net.UDPAddr) (int, error) 
 	}
 	if address == nil {
 		return 0, c.operationError("write", nil, errors.New("mipstack: UDP destination is required"))
+	}
+	if address.Port < 0 || address.Port > 65535 {
+		return 0, c.operationError("write", address, syscall.EINVAL)
 	}
 	return c.writeToUDPAddrPort(payload, address.AddrPort(), address)
 }
@@ -1336,6 +1349,9 @@ func (c *UDPConn) WriteMsgUDP(payload, oob []byte, address *net.UDPAddr) (n, oob
 	} else {
 		if address == nil {
 			return 0, 0, c.operationError("write", nil, errors.New("mipstack: UDP destination is required"))
+		}
+		if address.Port < 0 || address.Port > 65535 {
+			return 0, 0, c.operationError("write", address, syscall.EINVAL)
 		}
 		target = address.AddrPort()
 	}
@@ -1945,6 +1961,11 @@ func udpAddrPort(address net.Addr) (netip.AddrPort, error) {
 	if udp, ok := address.(*net.UDPAddr); ok {
 		if udp == nil {
 			return netip.AddrPort{}, errors.New("mipstack: UDP destination is required")
+		}
+		// Go net on Linux validates the port before sockaddr conversion;
+		// UDPAddr.AddrPort instead truncates an out-of-range port to 16 bits.
+		if udp.Port < 0 || udp.Port > 65535 {
+			return netip.AddrPort{}, syscall.EINVAL
 		}
 		return udp.AddrPort(), nil
 	}

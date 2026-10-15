@@ -923,6 +923,16 @@ func (c *IPConn) readBatchMessage(message *SocketMessage, flags int, wait, consu
 
 // Read receives from a connected remote endpoint.
 func (c *IPConn) Read(buffer []byte) (int, error) {
+	// Go net on Linux treats an empty Read as a local-closure check, not
+	// a packet receive. Address and message reads still consume a packet.
+	if len(buffer) == 0 {
+		select {
+		case <-c.closed:
+			return 0, c.operationError("read", net.ErrClosed)
+		default:
+		}
+		return 0, nil
+	}
 	n, _, _, err := c.readDatagram(buffer, nil)
 	if err != nil {
 		return n, c.operationError("read", err)
@@ -940,8 +950,8 @@ func (c *IPConn) Read(buffer []byte) (int, error) {
 // complete reassembled IP packet length when IPHeaderIncludedOnRead is enabled.
 // It runs without c's connection state lock and must return promptly; it must
 // not call a read method on c. The caller owns the returned slice, and c does
-// not retain it. A nil callback returns EINVAL. A short returned slice
-// truncates and consumes the datagram, matching Read.
+// not retain it. A nil callback returns EINVAL. A short or empty returned slice
+// truncates and consumes the datagram.
 //
 // This is an experimental API and is not covered by the package's stability
 // guarantees.
@@ -1063,8 +1073,9 @@ func (c *IPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, peek
 			datagram = queued
 			if !peek {
 				c.queuedBytes -= ipDatagramMetadataSize + len(datagram.payload)
-				c.notifyReceiveLocked()
 			}
+			// Linux MSG_PEEK preserves readability for other waiting readers.
+			c.notifyReceiveLocked()
 			n = copyMessagePayload(buffers, datagram.payload)
 			truncated = n < len(datagram.payload)
 			if truncated && returnLength {

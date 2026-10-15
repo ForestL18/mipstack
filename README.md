@@ -783,9 +783,9 @@ bounded wait for acknowledgement. `UDPConn.SetReadBuffer` changes the receive
 queue's approximate retained-memory capacity; payload, per-datagram metadata,
 and queued asynchronous errors share the bound. `IPConn` applies the same policy.
 `SetReceiveErrors(true)` retains reportable asynchronous ICMP errors for
-nonblocking `ReadError`; an empty error queue returns `EAGAIN`. Ordinary reads,
-UDP writes, and header-included IP writes also report a pending error without
-removing its `ReadError` entry; protocol-payload IP writes do not report it.
+nonblocking `ReadError`; an empty error queue returns `EAGAIN`. Ordinary receive
+attempts, UDP writes, and header-included IP writes also report a pending error
+without removing its `ReadError` entry; protocol-payload IP writes do not report it.
 By default, unconnected sockets do not report asynchronous ICMP errors
 (correlated PMTU updates still apply), while connected sockets report hard
 errors before queued payloads. Disabling the option clears `ReadError` entries

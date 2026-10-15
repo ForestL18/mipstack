@@ -4135,3 +4135,82 @@ func BenchmarkPublicICMPErrorCodec(b *testing.B) {
 		}
 	})
 }
+
+func TestICMPErrorPreservesQuotedMobilityProtocol(t *testing.T) {
+	local, remote := netip.MustParseAddr("2001:db8::249"), netip.MustParseAddr("2001:db8::250")
+	mobility := make([]byte, 16)
+	mobility[0], mobility[1], mobility[2] = ProtocolNoNextHeader, 1, 5
+	binary.BigEndian.PutUint16(mobility[4:6], transportChecksum(local, remote, IPv6ExtensionHeaderMobility, mobility))
+	for _, extension := range []byte{IPv6ExtensionHeaderMobility, IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderFragment} {
+		for _, quotedSize := range []int{0, 4, len(mobility)} {
+			t.Run(fmt.Sprintf("next-%d/quoted-%d", extension, quotedSize), func(t *testing.T) {
+				payload := append([]byte(nil), mobility...)
+				prefix := 0
+				if extension != IPv6ExtensionHeaderMobility {
+					payload = append(make([]byte, 8), payload...)
+					payload[0] = IPv6ExtensionHeaderMobility
+					prefix = 8
+				}
+				quote := buildIPPacket(local, remote, extension, payload, 0, false)
+				quote = quote[:40+prefix+quotedSize]
+				message := make([]byte, 8+len(quote))
+				message[0] = ICMPv6TypePacketTooBig
+				binary.BigEndian.PutUint32(message[4:8], 1280)
+				copy(message[8:], quote)
+				networkError, ok := parseICMPError(ipPacket{source: remote, target: local, protocol: ProtocolICMPv6, payload: message})
+				if !ok || networkError.QuotedProtocol != IPv6ExtensionHeaderMobility || networkError.QuotedSource != local || networkError.QuotedTarget != remote || !bytes.Equal(networkError.QuotedPayload, mobility[:quotedSize]) {
+					t.Fatalf("Mobility quote = %+v, parsed %t", networkError, ok)
+				}
+				if quotedSize != 0 && &networkError.QuotedPayload[0] != &networkError.QuotedPacket[40+prefix] {
+					t.Fatal("Mobility payload is not a suffix of the quoted packet")
+				}
+			})
+		}
+	}
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	listened, err := stack.ListenIP(context.Background(), "ip6:135", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := listened.(*IPConn)
+	defer connection.Close()
+	other, err := stack.ListenIP(context.Background(), "ip6:59", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	for _, socket := range []*IPConn{connection, other.(*IPConn)} {
+		if err = socket.SetReceiveErrors(true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = other.WriteTo([]byte("unrelated"), ipNetAddr(remote)); err != nil {
+		t.Fatal(err)
+	}
+	_ = readOutboundPacket(t, stack)
+	if _, err = connection.WriteTo(mobility, ipNetAddr(remote)); err != nil {
+		t.Fatal(err)
+	}
+	original := readOutboundPacket(t, stack)
+	if err = writeTestPacket(stack, buildTestPacketTooBig(remote, local, original, 1280)); err != nil {
+		t.Fatal(err)
+	}
+	reported, readErr := connection.ReadError()
+	var networkError ICMPError
+	if readErr != nil || !errors.As(reported, &networkError) || networkError.QuotedProtocol != IPv6ExtensionHeaderMobility || !bytes.Equal(networkError.QuotedPayload, mobility) {
+		t.Fatalf("raw Mobility ICMP error = %#v, %v", reported, readErr)
+	}
+	if reported, readErr = other.(*IPConn).ReadError(); reported != nil || !errors.Is(readErr, syscall.EAGAIN) {
+		t.Fatalf("Mobility error was delivered to protocol 59: %#v, %v", reported, readErr)
+	}
+	if mtu, pathErr := stack.PathMTU(remote); pathErr != nil || mtu != 1280 {
+		t.Fatalf("Mobility PathMTU = %d, %v", mtu, pathErr)
+	}
+}
