@@ -346,7 +346,7 @@ func TestBBRPacedBatchBoundsFutureCredit(t *testing.T) {
 	const mss = 1000
 	start := time.Unix(100, 0)
 	controller := newTCPCongestionController(CongestionControlBBR)
-	controller.initialize(start, 0, time.Millisecond, 100*mss, 100*mss, mss, 1)
+	controller.initialize(CongestionPhaseOpen, start, 0, time.Millisecond, 100*mss, 100*mss, mss, 1)
 	controller.pacingSegments = tcpPacingInitialBurst
 	bbrState(t, &controller).pacingRate = 1_000_000
 	bbrState(t, &controller).nextSend = start
@@ -430,7 +430,7 @@ func TestBBRLatePacingWakeMarksDeliverySampleSchedulerLimited(t *testing.T) {
 	const mss = 1000
 	start := time.Unix(100, 0)
 	controller := newTCPCongestionController(CongestionControlBBR)
-	controller.initialize(start, 0, 10*time.Millisecond, 20*mss, 20*mss, mss, 1)
+	controller.initialize(CongestionPhaseOpen, start, 0, 10*time.Millisecond, 20*mss, 20*mss, mss, 1)
 	bbr := bbrState(t, &controller)
 	bbr.pacingRate = 1_000_000
 	bbr.nextSend = start.Add(10 * time.Millisecond)
@@ -701,7 +701,7 @@ func TestBBRExpiredMinimumRTTIgnoresDelayedACK(t *testing.T) {
 func TestBBRIdleRestartResetsSamplingInterval(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlBBR)
 	now := time.Unix(150, 0)
-	controller.initialize(now, 0, 0, 10_000, 10_000, 1000, 1)
+	controller.initialize(CongestionPhaseOpen, now, 0, 0, 10_000, 10_000, 1000, 1)
 	bbrState(t, &controller).bandwidth = 100000
 	bbrState(t, &controller).pacingRate = 100000
 	controller.delivery.firstSent = 10
@@ -721,7 +721,7 @@ func TestBBRIdleRestartUsesNeutralPacingAndSkipsProbeRTT(t *testing.T) {
 	const mss = 1000
 	controller := newTCPCongestionController(CongestionControlBBR)
 	start := time.Unix(100, 0)
-	controller.initialize(start, 10*time.Millisecond, 10*time.Millisecond, 10*mss, 10*mss, mss, 1)
+	controller.initialize(CongestionPhaseOpen, start, 10*time.Millisecond, 10*time.Millisecond, 10*mss, 10*mss, mss, 1)
 	bbrState(t, &controller).mode = bbrProbeBandwidth
 	bbrState(t, &controller).cycleIndex = 0
 	bbrState(t, &controller).bandwidth = 100000

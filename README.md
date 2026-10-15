@@ -980,7 +980,9 @@ observational callback before an implementation is replaced or its connection
 actor exits. It permits controller-owned cleanup but must return promptly and
 must not start work that outlives it. Implementations must ignore unknown event
 types so a newer stack can add observations without changing the one-method
-controller interface.
+controller interface. When replacing an existing controller, the initialization
+event includes the current transport recovery phase; replacement alone does not
+return the connection to the open phase.
 
 `CongestionState` supplies the Linux-style connection view. Controllers may
 change cwnd and ssthresh directly during the event types that permit those

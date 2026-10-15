@@ -2180,7 +2180,7 @@ func newTCPEstablishedState(c *TCPConn, sendNext uint32) *tcpEstablishedState {
 	if !c.handshakeTimeout {
 		state.rtt.observeAt(c.handshakeRTT, monotonicStampAt(c.stack.timestampEpoch, now))
 	}
-	state.congestionWindow, state.slowStartThreshold = state.controller.initialize(now, state.rtt.minimum, state.rtt.srtt, state.congestionWindow, state.slowStartThreshold, state.peerMSS, monotonicStampAt(c.stack.timestampEpoch, now))
+	state.congestionWindow, state.slowStartThreshold = state.controller.initialize(CongestionPhaseOpen, now, state.rtt.minimum, state.rtt.srtt, state.congestionWindow, state.slowStartThreshold, state.peerMSS, monotonicStampAt(c.stack.timestampEpoch, now))
 	initialWindowScaled := c.peerWindowScaling && !c.passive
 	state.lastAdvertisedWindow = c.receiveWindow(0, initialWindowScaled)
 	state.receiveWindowState = newTCPReceiveWindow(state.receiveNext, state.lastAdvertisedWindow, c.peerWindowScaling, initialWindowScaled, c.receiveWindowScale)
@@ -3740,6 +3740,10 @@ func (s *tcpEstablishedState) changeCongestionController(factory *CongestionCont
 		return
 	}
 	now := time.Now()
+	// Linux's tcp_reinit_congestion_control retains the transport phase.
+	// Changing algorithms is not the ACK progress that ends SACK recovery
+	// under RFC 6675 section 5.
+	phase := s.controller.state.Phase
 	s.controller.release(now, s.congestionWindow, s.slowStartThreshold, s.congestionFlight(), s.peerMSS, s.rtt.srtt, s.rtt.minimum)
 	c := s.connection
 	s.controller = newTCPCongestionControllerFromFactory(factory, CongestionControlContext{
@@ -3754,7 +3758,7 @@ func (s *tcpEstablishedState) changeCongestionController(factory *CongestionCont
 		s.outstanding[index].delivery = tcpDeliverySnapshot{}
 		s.outstanding[index].congestionPacketState = 0
 	}
-	s.congestionWindow, s.slowStartThreshold = s.controller.initialize(now, s.rtt.minimum, s.rtt.srtt, s.congestionWindow, s.slowStartThreshold, s.peerMSS, monotonicStampAt(c.stack.timestampEpoch, now))
+	s.congestionWindow, s.slowStartThreshold = s.controller.initialize(phase, now, s.rtt.minimum, s.rtt.srtt, s.congestionWindow, s.slowStartThreshold, s.peerMSS, monotonicStampAt(c.stack.timestampEpoch, now))
 	s.hyStart.disable()
 	s.pacing = false
 	s.pacingDeadline = time.Time{}
@@ -5921,7 +5925,7 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 		c.mu.Lock()
 		if c.userClosed || c.writeClosed || c.terminalErr != nil {
 			c.sendBuffer.limited = false
-			err := c.connectionErrorLocked()
+			err := c.writeErrorLocked()
 			c.mu.Unlock()
 			return written, err
 		}
@@ -5969,7 +5973,7 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 		case <-c.done:
 			c.mu.Lock()
 			c.sendBuffer.limited = false
-			err := c.connectionErrorLocked()
+			err := c.writeErrorLocked()
 			c.mu.Unlock()
 			return written, err
 		}
@@ -6647,6 +6651,24 @@ func (c *TCPConn) connectionErrorLocked() error {
 	return net.ErrClosed
 }
 
+// writeErrorLocked resolves a failed write while c.mu is held. Go net on Linux
+// checks an expired deadline before the syscall can report peer termination,
+// but local closure takes precedence over the deadline.
+func (c *TCPConn) writeErrorLocked() error {
+	if !c.writeClosed && !c.locallyClosedLocked() {
+		select {
+		case <-c.stack.closeCh:
+		default:
+			select {
+			case <-c.writeDeadline.channelLocked():
+				return os.ErrDeadlineExceeded
+			default:
+			}
+		}
+	}
+	return c.connectionErrorLocked()
+}
+
 // locallyClosedLocked distinguishes application closure or local cancellation
 // from peer protocol termination. The caller holds c.mu.
 func (c *TCPConn) locallyClosedLocked() bool {
@@ -6869,8 +6891,9 @@ func (c *TCPConn) finish(err error) {
 	}
 	c.mu.Lock()
 	c.terminalErr = err
-	// Go net on Linux keeps buffered data after peer reset subject to the
-	// read deadline. Local closure or an empty terminal queue needs no timer.
+	// Buffered receive data remains subject to the application read deadline
+	// after peer termination. Local closure or an empty terminal queue
+	// releases the read timer.
 	if discardReceive || c.userClosed || c.readClosed || c.readBuffer.size == 0 {
 		c.readDeadline.stopLocked()
 	}

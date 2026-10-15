@@ -4172,7 +4172,6 @@ func (d *socketDeadline) setLocked(deadline time.Time) {
 	if d.timer != nil && !d.timer.Stop() {
 		<-d.done
 	}
-	d.timer = nil
 	closed := false
 	select {
 	case <-d.done:
@@ -4180,6 +4179,7 @@ func (d *socketDeadline) setLocked(deadline time.Time) {
 	default:
 	}
 	if deadline.IsZero() {
+		d.timer = nil
 		if closed {
 			d.done = make(chan struct{})
 		}
@@ -4188,11 +4188,18 @@ func (d *socketDeadline) setLocked(deadline time.Time) {
 	if duration := time.Until(deadline); duration > 0 {
 		if closed {
 			d.done = make(chan struct{})
+			d.timer = nil
 		}
-		done := d.done
-		d.timer = time.AfterFunc(duration, func() { close(done) })
+		if d.timer != nil {
+			// Reuse the callback only while its captured generation remains open.
+			d.timer.Reset(duration)
+		} else {
+			done := d.done
+			d.timer = time.AfterFunc(duration, func() { close(done) })
+		}
 		return
 	}
+	d.timer = nil
 	if !closed {
 		close(d.done)
 	}

@@ -300,7 +300,7 @@ func (c *tcpCongestionController) syncDeliveryState() {
 }
 
 // setCongestionPhase publishes one slow-path phase transition. Initialization
-// seeds Open directly so it remains the first controller callback.
+// seeds the current phase directly so it remains the first controller callback.
 func (c *tcpCongestionController) setCongestionPhase(phase CongestionPhase, now time.Time) {
 	if c.state.Phase == phase {
 		return
@@ -756,9 +756,9 @@ func (c *tcpCongestionController) customWindowValidation() bool {
 	return c.features&CongestionControlFeatureCustomWindowValidation != 0
 }
 
-// initialize seeds optional delivery and pacing models from the connection's
-// handshake observations.
-func (c *tcpCongestionController) initialize(now time.Time, minimumRTT, smoothedRTT time.Duration, window, slowStartThreshold uint32, mss int, stamp monotonicStamp) (uint32, uint32) {
+// initialize seeds the controller from the current transport phase, window,
+// and RTT observations before its first callback.
+func (c *tcpCongestionController) initialize(phase CongestionPhase, now time.Time, minimumRTT, smoothedRTT time.Duration, window, slowStartThreshold uint32, mss int, stamp monotonicStamp) (uint32, uint32) {
 	if c.usesDeliveryRate() {
 		c.delivery.initializeDelivery(now, minimumRTT, stamp)
 	}
@@ -768,7 +768,7 @@ func (c *tcpCongestionController) initialize(now time.Time, minimumRTT, smoothed
 	c.state.MinimumRTT = minimumRTT
 	c.state.SmoothedRTT = smoothedRTT
 	c.state.MaximumPacingRate = c.maximumPacingRate
-	c.state.Phase = CongestionPhaseOpen
+	c.state.Phase = phase
 	c.syncDeliveryState()
 	c.prepareEvent(CongestionEventInitialize, now)
 	c.handleEvent()

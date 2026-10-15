@@ -5032,7 +5032,7 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 func TestTCPRecoveryUndoRestoresNestedTransportState(t *testing.T) {
 	now := time.Unix(100, 0)
 	controller := newTCPCongestionController(CongestionControlCUBIC)
-	_, _ = controller.initialize(now, 10*time.Millisecond, 20*time.Millisecond, 20_000, 10_000, 1000, 1)
+	_, _ = controller.initialize(CongestionPhaseOpen, now, 10*time.Millisecond, 20*time.Millisecond, 20_000, 10_000, 1000, 1)
 	controller.setCongestionPhase(CongestionPhaseRecovery, now)
 	state := tcpEstablishedState{
 		connection: &TCPConn{stack: new(Stack)}, controller: controller,
@@ -5560,7 +5560,7 @@ func TestTCPCWRRecoveryPointTracksACKProgress(t *testing.T) {
 						state:     sentTCPSegmentTransmitted,
 						hostQueue: packetQueueTicket{queuedAt: monotonicStampAt(now, now)}}},
 				}
-				state.controller.initialize(now, time.Millisecond, time.Millisecond, 10_000, 10_000, 1000, 1)
+				state.controller.initialize(CongestionPhaseOpen, now, time.Millisecond, time.Millisecond, 10_000, 10_000, 1000, 1)
 				segment := tcpSegment{sequence: 100, acknowledgement: start, flags: TCPFlagACK | TCPFlagECE, window: 20_000}
 				state.processAcknowledgment(&segment, now.Add(time.Millisecond), 0)
 				if state.controller.state.Phase != CongestionPhaseCWR || !state.ecnRecoveryActive || state.ecnRecoveryPoint != state.sendNext {
@@ -5606,7 +5606,7 @@ func TestTCPOldACKOnlyReportsNewDeliveryEvidence(t *testing.T) {
 			Name: "old-ACK-delivery", Features: CongestionControlFeatureDeliveryRate,
 			New: func(CongestionControlContext) CongestionController { return recorder },
 		})
-		controller.initialize(now, time.Millisecond, time.Millisecond, 10_000, 10_000, 1000, 1)
+		controller.initialize(CongestionPhaseOpen, now, time.Millisecond, time.Millisecond, 10_000, 10_000, 1000, 1)
 		connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 		connection.stack = &Stack{timestampEpoch: now}
 		state := tcpEstablishedState{
@@ -10663,7 +10663,7 @@ func TestTCPZeroWindowRetransmissionDisablesLossEvidence(t *testing.T) {
 		Name: "zero-window-loss-evidence", New: func(CongestionControlContext) CongestionController { return recorder },
 		Features: CongestionControlFeatureDeliveryRate | CongestionControlFeatureTransmissionEvents | CongestionControlFeatureLossEvents,
 	})
-	controller.initialize(now, time.Millisecond, time.Millisecond, 20_000, 40_000, 1000, 1)
+	controller.initialize(CongestionPhaseOpen, now, time.Millisecond, time.Millisecond, 20_000, 40_000, 1000, 1)
 	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	connection.stack = &Stack{timestampEpoch: now}
 	state := tcpEstablishedState{
@@ -13297,7 +13297,7 @@ func BenchmarkTCPAcknowledgmentCycle(b *testing.B) {
 						controller: newTCPCongestionController(algorithm),
 						rtt:        rttEstimator{srtt: time.Millisecond, minimum: time.Millisecond, rto: time.Second},
 					}
-					state.controller.initialize(start, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
+					state.controller.initialize(CongestionPhaseOpen, start, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
 					var outstanding [2]sentTCPSegment
 					segment := tcpSegment{sequence: 200, flags: TCPFlagACK, window: 65535}
 					if selective {
@@ -16822,6 +16822,106 @@ func BenchmarkTCPSetDeadline(b *testing.B) {
 	}
 }
 
+// BenchmarkTCPDeadlineUpdates measures sliding deadlines and transitions that
+// clear or expire the current wait-channel generation.
+func BenchmarkTCPDeadlineUpdates(b *testing.B) {
+	for _, operation := range []struct {
+		name string
+		set  func(*TCPConn, time.Time) error
+	}{
+		{name: "Read", set: (*TCPConn).SetReadDeadline},
+		{name: "Write", set: (*TCPConn).SetWriteDeadline},
+		{name: "Both", set: (*TCPConn).SetDeadline},
+	} {
+		operation := operation
+		b.Run(operation.name, func(b *testing.B) {
+			for _, transition := range []string{"refresh", "clear", "expire"} {
+				transition := transition
+				b.Run(transition, func(b *testing.B) {
+					connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+					defer func() {
+						connection.mu.Lock()
+						connection.readDeadline.stopLocked()
+						connection.writeDeadline.stopLocked()
+						connection.mu.Unlock()
+					}()
+					future := time.Now().Add(time.Hour)
+					past := time.Now().Add(-time.Second)
+					if err := operation.set(connection, future); err != nil {
+						b.Fatal(err)
+					}
+					b.ReportAllocs()
+					b.ResetTimer()
+					for index := 0; index < b.N; index++ {
+						deadline := future
+						if transition == "refresh" {
+							deadline = time.Now().Add(time.Hour)
+						}
+						if err := operation.set(connection, deadline); err != nil {
+							b.Fatal(err)
+						}
+						switch transition {
+						case "clear":
+							if err := operation.set(connection, time.Time{}); err != nil {
+								b.Fatal(err)
+							}
+						case "expire":
+							if err := operation.set(connection, past); err != nil {
+								b.Fatal(err)
+							}
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+// BenchmarkTCPApplicationReadDeadline includes a sliding read deadline in the
+// application receive path for caller-owned and lazily supplied buffers.
+func BenchmarkTCPApplicationReadDeadline(b *testing.B) {
+	for _, payloadSize := range []int{64, 1200} {
+		payloadSize := payloadSize
+		b.Run(fmt.Sprintf("%dB", payloadSize), func(b *testing.B) {
+			for _, mode := range []string{"Read", "ReadWithBuffer"} {
+				mode := mode
+				b.Run(mode, func(b *testing.B) {
+					connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+					defer func() {
+						connection.mu.Lock()
+						connection.readDeadline.stopLocked()
+						connection.mu.Unlock()
+					}()
+					payload := bytes.Repeat([]byte{0x5a}, payloadSize)
+					buffer := make([]byte, payloadSize)
+					getBuffer := func(_ int) []byte { return buffer }
+					b.SetBytes(int64(payloadSize))
+					b.ReportAllocs()
+					b.ResetTimer()
+					for index := 0; index < b.N; index++ {
+						if accepted := connection.appendReadBuffer(payload, payload, 0, 0); accepted != payloadSize {
+							b.Fatalf("accepted %d of %d bytes", accepted, payloadSize)
+						}
+						if err := connection.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
+							b.Fatal(err)
+						}
+						var n int
+						var err error
+						if mode == "Read" {
+							n, err = connection.Read(buffer)
+						} else {
+							n, err = connection.ReadWithBuffer(getBuffer)
+						}
+						if err != nil || n != payloadSize || buffer[0] != 0x5a {
+							b.Fatalf("%s = %d, %v, first byte %#x", mode, n, err, buffer[0])
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func BenchmarkPublicTCPSegmentCodec(b *testing.B) {
 	segment := TCPSegment{
 		Source: netip.MustParseAddrPort("192.0.2.1:12345"), Destination: netip.MustParseAddrPort("198.51.100.2:443"),
@@ -17144,6 +17244,86 @@ func TestTCPEmptyReadPreservesReceiveState(t *testing.T) {
 	}
 }
 
+// TestTCPDeadlineRearmWakesBlockedIO exercises live timer updates while public
+// reads and writes are waiting for receive data or send-buffer capacity.
+func TestTCPDeadlineRearmWakesBlockedIO(t *testing.T) {
+	for _, operation := range []string{"Read", "ReadWithBuffer", "Write", "ReadFrom"} {
+		t.Run(operation, func(t *testing.T) {
+			_, _, connection := newManuallyPumpedTCPConnection(t)
+			defer connection.Close()
+			writing := operation == "Write" || operation == "ReadFrom"
+			if writing {
+				if err := connection.SetWriteBuffer(64); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := connection.SetDeadline(time.Now().Add(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			connection.mu.Lock()
+			readTimer, writeTimer := connection.readDeadline.timer, connection.writeDeadline.timer
+			readGeneration, writeGeneration := connection.readDeadline.done, connection.writeDeadline.done
+			connection.mu.Unlock()
+			type result struct {
+				n         int64
+				err       error
+				callbacks int
+			}
+			completed := make(chan result, 1)
+			go func() {
+				var got result
+				switch operation {
+				case "Read":
+					n, err := connection.Read(make([]byte, 1))
+					got.n, got.err = int64(n), err
+				case "ReadWithBuffer":
+					n, err := connection.ReadWithBuffer(func(_ int) []byte {
+						got.callbacks++
+						return make([]byte, 1)
+					})
+					got.n, got.err = int64(n), err
+				case "Write":
+					n, err := connection.Write(make([]byte, 128))
+					got.n, got.err = int64(n), err
+				case "ReadFrom":
+					got.n, got.err = connection.ReadFrom(bytes.NewReader(make([]byte, 128)))
+				}
+				completed <- got
+			}()
+			waitFor(t, time.Second, func() bool {
+				connection.mu.Lock()
+				defer connection.mu.Unlock()
+				if writing {
+					return connection.sendBuffer.size == 64 && connection.sendBuffer.limited
+				}
+				return connection.readNotify != nil
+			})
+			if err := connection.SetDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			connection.mu.Lock()
+			reused := connection.readDeadline.timer == readTimer && connection.writeDeadline.timer == writeTimer &&
+				connection.readDeadline.done == readGeneration && connection.writeDeadline.done == writeGeneration
+			connection.mu.Unlock()
+			if !reused {
+				t.Fatal("updating a blocked operation replaced its timer or wait-channel generation")
+			}
+			var want int64
+			if writing {
+				want = 64
+			}
+			select {
+			case got := <-completed:
+				if got.n != want || !errors.Is(got.err, os.ErrDeadlineExceeded) || got.callbacks != 0 {
+					t.Fatalf("%s = %d, %v, callback calls %d, want %d and deadline", operation, got.n, got.err, got.callbacks, want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("updated deadline did not wake the blocked operation")
+			}
+		})
+	}
+}
+
 func TestTCPResetReleasesUnusedReadTimer(t *testing.T) {
 	link, _, connection := newManuallyPumpedTCPConnection(t)
 	defer connection.Close()
@@ -17268,6 +17448,165 @@ func TestTCPResetPreservesReadDeadline(t *testing.T) {
 	}
 }
 
+func TestTCPResetWriteDeadlinePriority(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expired-before-reset-%t", expired), func(t *testing.T) {
+			link, _, connection := newManuallyPumpedTCPConnection(t)
+			defer connection.Close()
+			deadline := time.Now().Add(time.Hour)
+			want := error(syscall.ECONNRESET)
+			if expired {
+				deadline = time.Now().Add(-time.Second)
+				want = os.ErrDeadlineExceeded
+			}
+			if err := connection.SetWriteDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			link.mu.Lock()
+			peer := link.tcp[connection.key.local.Port()]
+			sequence, acknowledgement := peer.serverNext, peer.clientNext
+			link.mu.Unlock()
+			if err := link.deliverTCP(connection.key.remote.Port(), connection.key.local.Port(), sequence, acknowledgement, TCPFlagRST, 0, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-connection.done:
+			case <-time.After(time.Second):
+				t.Fatal("RST did not terminate the protocol actor")
+			}
+			connection.mu.Lock()
+			armed := connection.writeDeadline.timer != nil
+			connection.mu.Unlock()
+			if armed {
+				t.Fatal("peer termination retained a write timer")
+			}
+			for _, state := range []struct {
+				name string
+				time time.Time
+				set  bool
+				want error
+			}{
+				{name: "existing", want: want},
+				{name: "past", time: time.Now().Add(-time.Second), set: true, want: os.ErrDeadlineExceeded},
+				{name: "future", time: time.Now().Add(time.Hour), set: true, want: syscall.ECONNRESET},
+				{name: "cleared", set: true, want: syscall.ECONNRESET},
+			} {
+				if state.set {
+					if err := connection.SetWriteDeadline(state.time); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for _, operation := range []struct {
+					name string
+					call func() (int64, error)
+				}{
+					{name: "Write", call: func() (int64, error) { n, err := connection.Write([]byte{1}); return int64(n), err }},
+					{name: "empty Write", call: func() (int64, error) { n, err := connection.Write(nil); return int64(n), err }},
+					{name: "ReadFrom", call: func() (int64, error) { return connection.ReadFrom(bytes.NewBuffer([]byte{1})) }},
+				} {
+					if n, err := operation.call(); n != 0 || !errors.Is(err, state.want) {
+						t.Fatalf("%s with %s deadline = %d, %v, want %v", operation.name, state.name, n, err, state.want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestTCPWriteTerminalDeadlinePriority(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		prepare func(*TCPConn)
+		want    error
+	}{
+		{name: "peer reset", prepare: func(c *TCPConn) { c.finish(syscall.ECONNRESET) }, want: os.ErrDeadlineExceeded},
+		{name: "transport timeout", prepare: func(c *TCPConn) { c.finish(syscall.ETIMEDOUT) }, want: os.ErrDeadlineExceeded},
+		{name: "local Close", prepare: func(c *TCPConn) { _ = c.Close(); c.finish(net.ErrClosed) }, want: net.ErrClosed},
+		{name: "CloseWrite", prepare: func(c *TCPConn) { _ = c.CloseWrite(); c.finish(syscall.ECONNRESET) }, want: syscall.ECONNRESET},
+		{name: "local abort", prepare: func(c *TCPConn) { c.abort(syscall.ECONNABORTED); c.finish(syscall.ECONNABORTED) }, want: syscall.ECONNABORTED},
+		{name: "Stack Close", prepare: func(c *TCPConn) { close(c.stack.closeCh); c.finish(ErrClosed) }, want: net.ErrClosed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, payload := range [][]byte{nil, {1}} {
+				connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				connection.stack = &Stack{closeCh: make(chan struct{})}
+				defer connection.Close()
+				if err := connection.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				test.prepare(connection)
+				if n, err := connection.Write(payload); n != 0 || !errors.Is(err, test.want) {
+					t.Fatalf("Write(%d bytes) = %d, %v, want %v", len(payload), n, err, test.want)
+				}
+				connection.mu.Lock()
+				armed := connection.writeDeadline.timer != nil
+				connection.mu.Unlock()
+				if armed {
+					t.Fatal("expired or locally closed write retained an armed timer")
+				}
+			}
+		})
+	}
+}
+
+func TestTCPBlockedWriteTerminalDeadlinePriority(t *testing.T) {
+	for _, operation := range []string{"Write", "ReadFrom"} {
+		for _, expired := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/expired-%t", operation, expired), func(t *testing.T) {
+				connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				connection.stack = &Stack{closeCh: make(chan struct{})}
+				defer connection.Close()
+				connection.sendCapacity = 64
+				payload := bytes.Repeat([]byte{1}, 128)
+				type result struct {
+					n   int64
+					err error
+				}
+				completed := make(chan result, 1)
+				go func() {
+					if operation == "Write" {
+						n, err := connection.Write(payload)
+						completed <- result{int64(n), err}
+					} else {
+						n, err := connection.ReadFrom(bytes.NewBuffer(payload))
+						completed <- result{n, err}
+					}
+				}()
+				waitFor(t, time.Second, func() bool {
+					connection.mu.Lock()
+					defer connection.mu.Unlock()
+					return connection.sendBuffer.size == 64 && connection.sendBuffer.limited
+				})
+				// Without a deadline, termination is the only notification. With
+				// both notifications ready, either preserves the same result.
+				connection.mu.Lock()
+				connection.terminalErr = syscall.ECONNRESET
+				want := error(syscall.ECONNRESET)
+				if expired {
+					connection.writeDeadline.setLocked(time.Now().Add(-time.Second))
+					want = os.ErrDeadlineExceeded
+				}
+				close(connection.done)
+				connection.mu.Unlock()
+				select {
+				case got := <-completed:
+					if got.n != 64 || !errors.Is(got.err, want) {
+						t.Fatalf("blocked %s = %d, %v, want %v", operation, got.n, got.err, want)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("actor termination did not wake the writer")
+				}
+				connection.mu.Lock()
+				limited, queued := connection.sendBuffer.limited, connection.sendBuffer.size
+				connection.mu.Unlock()
+				if limited || queued != 64 {
+					t.Fatalf("writer completion changed accepted bytes or pressure state: queued %d limited %t", queued, limited)
+				}
+			})
+		}
+	}
+}
+
 func TestTCPFirstUnsackedSegment(t *testing.T) {
 	for _, test := range []struct {
 		name     string
@@ -17303,9 +17642,10 @@ func TestTCPFRTOAfterCongestionControlChange(t *testing.T) {
 						outstanding: []sentTCPSegment{{sequence: 2000, end: 3000}, {sequence: 3000, end: 4000}, {sequence: 4000, end: 5000}, {sequence: 5000, end: 6000}},
 						undo:        &tcpRecoveryUndo{},
 					}
-					state.controller.initialize(start, time.Millisecond, time.Millisecond, 8000, 16000, 1000, monotonicStampAt(start, start))
+					state.controller.initialize(CongestionPhaseOpen, start, time.Millisecond, time.Millisecond, 8000, 16000, 1000, monotonicStampAt(start, start))
 					state.undo.begin(true, 4000, 8000, 16000, 4000, &state.controller, state.rtt, start)
 					state.undo.recordRetransmission(1000, 2000, 1, false)
+					state.controller.setCongestionPhase(CongestionPhaseLoss, start)
 					if phase == tcpFRTOProbePending {
 						state.frtoProbeBudget = 1
 					}
@@ -17318,6 +17658,9 @@ func TestTCPFRTOAfterCongestionControlChange(t *testing.T) {
 					}
 					state.changeCongestionController(factory, 0)
 					defer state.controller.release(time.Now(), state.congestionWindow, state.slowStartThreshold, state.congestionFlight(), state.peerMSS, state.rtt.srtt, state.rtt.minimum)
+					if state.controller.state.Phase != CongestionPhaseLoss {
+						t.Fatal("controller replacement left the timeout recovery phase")
+					}
 					if state.undo.active {
 						t.Fatal("controller replacement retained its predecessor's undo snapshot")
 					}
@@ -17385,9 +17728,10 @@ func TestTCPFRTOSACKAfterCongestionControlChange(t *testing.T) {
 						state.outstanding[0].state.set(sentTCPSegmentRACKLost, true)
 						state.haveRACKLoss = true
 					}
-					state.controller.initialize(start, time.Millisecond, time.Millisecond, 8000, 16000, 1000, monotonicStampAt(start, start))
+					state.controller.initialize(CongestionPhaseOpen, start, time.Millisecond, time.Millisecond, 8000, 16000, 1000, monotonicStampAt(start, start))
 					state.undo.begin(true, 4000, 8000, 16000, 4000, &state.controller, state.rtt, start)
 					state.undo.recordRetransmission(1000, 2000, 1, false)
+					state.controller.setCongestionPhase(CongestionPhaseLoss, start)
 					registered, _ := registeredCongestionControlFactory(algorithm)
 					definition := registered.definition
 					definition.Name = "test-frto-sack-replacement-" + algorithm
@@ -17399,6 +17743,9 @@ func TestTCPFRTOSACKAfterCongestionControlChange(t *testing.T) {
 					defer func() {
 						state.controller.release(time.Now(), state.congestionWindow, state.slowStartThreshold, state.congestionFlight(), state.peerMSS, state.rtt.srtt, state.rtt.minimum)
 					}()
+					if state.controller.state.Phase != CongestionPhaseLoss {
+						t.Fatal("controller replacement left the timeout recovery phase")
+					}
 					if state.undo.active {
 						t.Fatal("controller replacement retained its predecessor's undo snapshot")
 					}

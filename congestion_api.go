@@ -261,8 +261,9 @@ type CongestionEventType uint8
 const (
 	// CongestionEventUnknown is never sent by TCP.
 	CongestionEventUnknown CongestionEventType = iota
-	// CongestionEventInitialize seeds a newly established controller and
-	// permits updates to its initial cwnd, ssthresh, and pacing-rate policy.
+	// CongestionEventInitialize seeds a new controller from the connection's
+	// current transport state, including its phase when replacing an existing
+	// controller. It permits updates to cwnd, ssthresh, and pacing-rate policy.
 	CongestionEventInitialize
 	// CongestionEventACK reports newly delivered data and permits updates to
 	// cwnd, ssthresh, and the common pacing-rate policy.

@@ -1260,64 +1260,124 @@ func TestSocketDeadlineRefreshAndClear(t *testing.T) {
 	}
 }
 
-func TestSocketDeadlineStoppedCallbackCannotExpireRearmedDeadline(t *testing.T) {
+func TestSocketDeadlineReusesLiveTimer(t *testing.T) {
 	var deadline socketDeadline
-	deadline.waitLocked()
-	initial := deadline.done
-	started, release := make(chan struct{}), make(chan struct{})
-	deadline.timer = time.AfterFunc(0, func() {
-		close(started)
-		<-release
-		close(initial)
-	})
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		close(release)
-		t.Fatal("deadline callback did not start")
-	}
-	finished := make(chan chan struct{}, 1)
-	joined := make(chan struct{})
-	go func() {
-		defer close(joined)
-		deadline.stopLocked()
-		deadline.setLocked(time.Now().Add(time.Hour))
-		finished <- deadline.done
-	}()
-	t.Cleanup(func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-		select {
-		case <-joined:
-			deadline.stopLocked()
-		case <-time.After(time.Second):
-			t.Error("deadline worker did not finish")
-		}
-	})
-	var rearmed chan struct{}
-	select {
-	case rearmed = <-finished:
-	case <-time.After(25 * time.Millisecond):
-	}
-	close(release)
-	if rearmed == nil {
-		select {
-		case rearmed = <-finished:
-		case <-time.After(time.Second):
-			t.Fatal("deadline did not rearm after the callback")
+	defer deadline.stopLocked()
+	future := time.Now().Add(time.Hour)
+	deadline.setLocked(future)
+	timer, generation := deadline.timer, deadline.done
+	for _, value := range []time.Time{future.Add(time.Hour), future.Add(-time.Minute), future} {
+		deadline.setLocked(value)
+		if deadline.timer != timer || deadline.done != generation {
+			t.Fatal("future deadline update replaced the live timer or generation")
 		}
 	}
-	<-initial
-	if rearmed == initial {
-		t.Fatal("rearmed deadline reused the stopped callback generation")
+	deadline.setLocked(time.Time{})
+	if deadline.timer != nil || deadline.done != generation {
+		t.Fatal("clearing a live deadline retained its timer or replaced its generation")
 	}
 	select {
-	case <-rearmed:
-		t.Fatal("old callback expired the rearmed deadline")
+	case <-generation:
+		t.Fatal("clearing a live deadline closed its generation")
 	default:
+	}
+	deadline.setLocked(future)
+	if deadline.timer == nil || deadline.timer == timer || deadline.done != generation {
+		t.Fatal("rearming a cleared deadline did not create a timer for the existing generation")
+	}
+	deadline.stopLocked()
+	if deadline.timer != nil {
+		t.Fatal("stopping a reused timer retained its handle")
+	}
+}
+
+func TestSocketDeadlineReusedTimerExpires(t *testing.T) {
+	var deadline socketDeadline
+	defer deadline.stopLocked()
+	deadline.setLocked(time.Now().Add(time.Hour))
+	timer, generation := deadline.timer, deadline.done
+	deadline.setLocked(time.Now().Add(50 * time.Millisecond))
+	select {
+	case <-generation:
+	case <-time.After(time.Second):
+		t.Fatal("rearmed deadline did not close its shared generation")
+	}
+	deadline.setLocked(time.Now().Add(time.Hour))
+	if deadline.timer == nil || deadline.timer == timer || deadline.done == generation {
+		t.Fatal("refreshing a fired timer reused its callback or closed generation")
+	}
+	select {
+	case <-deadline.done:
+		t.Fatal("refreshed deadline is already expired")
+	default:
+	}
+}
+
+func TestSocketDeadlineStoppedCallbackCannotExpireRearmedDeadline(t *testing.T) {
+	for _, stopFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stop-first-%t", stopFirst), func(t *testing.T) {
+			var deadline socketDeadline
+			deadline.waitLocked()
+			initial := deadline.done
+			started, release := make(chan struct{}), make(chan struct{})
+			deadline.timer = time.AfterFunc(0, func() {
+				close(started)
+				<-release
+				close(initial)
+			})
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				close(release)
+				t.Fatal("deadline callback did not start")
+			}
+			finished := make(chan chan struct{}, 1)
+			joined := make(chan struct{})
+			go func() {
+				defer close(joined)
+				if stopFirst {
+					deadline.stopLocked()
+				}
+				deadline.setLocked(time.Now().Add(time.Hour))
+				finished <- deadline.done
+			}()
+			t.Cleanup(func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+				select {
+				case <-joined:
+					deadline.stopLocked()
+				case <-time.After(time.Second):
+					t.Error("deadline worker did not finish")
+				}
+			})
+			var rearmed chan struct{}
+			select {
+			case rearmed = <-finished:
+				t.Fatal("deadline replacement returned before the running callback completed")
+			case <-time.After(25 * time.Millisecond):
+			}
+			close(release)
+			if rearmed == nil {
+				select {
+				case rearmed = <-finished:
+				case <-time.After(time.Second):
+					t.Fatal("deadline did not rearm after the callback")
+				}
+			}
+			<-initial
+			if rearmed == initial {
+				t.Fatal("rearmed deadline reused the stopped callback generation")
+			}
+			select {
+			case <-rearmed:
+				t.Fatal("old callback expired the rearmed deadline")
+			default:
+			}
+		})
 	}
 }
 
